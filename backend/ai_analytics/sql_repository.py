@@ -198,6 +198,60 @@ def get_ai_invoice_record_for_claim(claim_id: int) -> Optional[Dict[str, Any]]:
         raise
 
 
+CLAIM_LIFECYCLE_SQL = """
+SELECT
+    c.id,
+    c.ClaimCurrentTypeId,
+    c.status,
+    c.archived
+FROM dbo.Claims c
+WHERE c.id IN (
+    -- CAST is required: for large claim batches pyodbc sends the CSV param
+    -- as ntext, which STRING_SPLIT rejects ("Argument data type ntext is
+    -- invalid for argument 1"). Without the cast the query fails and the
+    -- caller silently gets no lifecycle data.
+    SELECT value FROM STRING_SPLIT(CAST(%(claim_ids_csv)s AS nvarchar(max)), ',')
+)
+"""
+
+
+def get_claim_lifecycle_for_claims(
+    claim_ids: List[int],
+) -> Dict[int, Dict[str, Any]]:
+    """Fetch the run-lifecycle fields for a batch of claims.
+
+    This is the run record — the same source the Claims Breakdown buckets
+    use — so the AI dashboard's "New runs / Active runs" stages reconcile
+    exactly with those widgets:
+    - ``ClaimCurrentTypeId`` 1 = New Run, 4 = Active Run.
+    - ``status`` is the RH claim status (e.g. 'Unassigned' while the AI
+      works, 'Payment Received' / 'Denied' / 'Confirm the Receipt of
+      Invoice' after release).
+
+    Returns a dict keyed by claim_id →
+    ``{"type_id": int|None, "status": str|None, "archived": int|None}``.
+    Claims missing from Claims are absent from the dict.
+    """
+    csv = ",".join(str(int(cid)) for cid in claim_ids)
+    try:
+        rows = _execute_parameterized(CLAIM_LIFECYCLE_SQL, {"claim_ids_csv": csv})
+    except TargetDatabaseError as e:
+        logger.error(f"Failed to fetch claim lifecycle: {e}")
+        raise
+    by_claim: Dict[int, Dict[str, Any]] = {}
+    for row in rows:
+        try:
+            cid = int(row["id"])
+        except (ValueError, TypeError):
+            continue
+        by_claim[cid] = {
+            "type_id": row.get("ClaimCurrentTypeId"),
+            "status": row.get("status"),
+            "archived": row.get("archived"),
+        }
+    return by_claim
+
+
 # ---------------------------------------------------------------------------
 # Cancellation details
 # ---------------------------------------------------------------------------

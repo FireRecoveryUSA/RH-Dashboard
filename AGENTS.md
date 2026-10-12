@@ -274,6 +274,48 @@ claim buckets:
 column (`_resolve_claims_date_column()`) by preferring the temporal
 `AS_ROW_START` column and falling back to `DateCreated` or similar.
 
+## AI Outcomes Dashboard — Mongo-First Cohort (2026-10-11)
+
+The AI Outcomes dashboard cohort is **the projection, not SQL**. The AI
+record (`ai_line_items`) is created at the moment a run is submitted to us
+(`ai_inserted_at` == `Claims.date_of_submitted` expressed in UTC; org-local
+civil dates are UTC-7, configured via `AI_LOCAL_UTC_OFFSET_HOURS`), so
+`_load_normalized_cohort` in `backend/ai_analytics/outcome_service.py`
+queries `ai_invoice_analytics` (via
+`projection_read_repository.get_projection_cohort`) for the date window and
+normalizes each projection doc through the shared
+`build_normalized_record` with a synthetic SQL-row shape.
+
+Recovery Hub SQL is joined **only** for claims that reached the review grid
+(`line_items_save_to_rh_status` true) — process logs (released/cancelled)
+and cancellation details — because that is the point where the business
+process hands over to Recovery Hub. The old design gated the whole cohort
+on `AIInvoiceProcessRHTemp`, which only receives a row when the AI
+*completes* a claim, hiding every in-flight run (the "12 runs invisible in
+the current week" bug). Pre-grid claims with no terminal evidence are
+classified `pending`, never `unknown`.
+
+Date bases: `business_status_date` / `claim_created_date` /
+`ai_record_inserted_date` all resolve to `ai_inserted_at` (submitted to
+us); `ai_record_updated_date` resolves to `ai_updated_at`. Local date
+windows are converted to UTC windows using the org offset — do not filter
+the projection on raw UTC midnights.
+
+The funnel is **six period-scoped sections** (operator-specified
+2026-10-11), reconciled with the Claims Breakdown buckets via
+`sql_repo.get_claim_lifecycle_for_claims` (batched `ClaimCurrentTypeId` /
+`status` / `archived` PK lookup): 1. Step 1 fee card & value plugged in
+(breakdown per billing level, else category — NO "category no level"
+bucket; each row carries `value` = summed invoice_total) → 2. AI runs
+submitted this period (still in New Runs vs moved on) → 3. Left New Runs
+— claim status at handoff (grouped by RH claim status) → 4. HITL grid vs
+elsewhere (two rows) → 5. In the HITL grid now, pending review (by
+department; the invoice grid below lists them) → 6. Left the HITL grid —
+accepted/released (with RH status) or rejected (+ normalized
+rejection-reason breakdown). Stage counts are intentionally NOT
+monotonic — sections answer different questions about the same period
+cohort; each breakdown partitions its own stage.
+
 ## AI Analytics Worker — Phase 0
 
 The AI Analytics Worker is an event-driven projection service that reads

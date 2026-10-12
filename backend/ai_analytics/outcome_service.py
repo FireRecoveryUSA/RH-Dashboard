@@ -33,7 +33,6 @@ from .models import (
     AiInvoiceCohortResponse,
 )
 from . import sql_repository as sql_repo
-from . import mongo_repository as mongo_repo
 from . import projection_read_repository as projection_repo
 from .normalization import (
     build_normalized_record,
@@ -91,6 +90,58 @@ def _validate_date_span(start_date: Optional[str], end_date: Optional[str]) -> N
         pass
 
 
+_DATE_BASIS_TO_PROJECTION_FIELD = {
+    # The AI record is created at the moment the run is submitted to us
+    # (verified: ai_line_items.inserted_at == Claims.date_of_submitted
+    # expressed in UTC), so all "business" date bases resolve to the same
+    # projection timestamp. The AI Mongo data is the source of truth for
+    # where a run is in the process; Recovery Hub SQL is only joined for
+    # claims that reached the review grid (terminal released/cancelled).
+    "business_status_date": "ai_inserted_at",
+    "claim_created_date": "ai_inserted_at",
+    "ai_record_inserted_date": "ai_inserted_at",
+    "ai_record_updated_date": "ai_updated_at",
+}
+
+
+def _utc_window_for_local_dates(
+    start_date: Optional[str], end_date: Optional[str]
+) -> Tuple[Optional[Any], Optional[Any]]:
+    """Convert an org-local date window to a UTC datetime window.
+
+    Dashboard date ranges are local civil dates (the SQL date_of_submitted
+    convention). The projection timestamps are UTC. A run submitted 8 PM
+    local is already the next UTC day, so filtering the projection on raw
+    UTC midnight boundaries would drop it or shift it a day. The local
+    window is therefore shifted by the configured org offset
+    (``settings.AI_LOCAL_UTC_OFFSET_HOURS``, -7 = US MST) into UTC.
+    """
+    offset = timedelta(hours=settings.AI_LOCAL_UTC_OFFSET_HOURS)
+
+    def _to_utc(date_str: Optional[str], *, end: bool) -> Optional[Any]:
+        if not date_str:
+            return None
+        d = datetime.fromisoformat(date_str)
+        if end:
+            d = d + timedelta(days=1)
+        return d - offset  # local midnight → UTC instant
+
+    return _to_utc(start_date, end=False), _to_utc(end_date, end=True)
+
+
+def _local_date_str(dt: Optional[Any]) -> Optional[str]:
+    """Render a UTC projection timestamp as the org-local date string.
+
+    Mirrors ``_utc_window_for_local_dates``: local = UTC + offset.
+    """
+    if dt is None:
+        return None
+    if isinstance(dt, str):
+        return dt
+    local = dt + timedelta(hours=settings.AI_LOCAL_UTC_OFFSET_HOURS)
+    return local.date().isoformat()
+
+
 async def _load_normalized_cohort(
     ai_db,
     filters: AiAnalyticsFilters,
@@ -99,13 +150,19 @@ async def _load_normalized_cohort(
 
     Returns (normalized_records, source_status, data_complete).
 
-    When ``settings.AI_ANALYTICS_USE_PROJECTION`` is true (Phase 9), step 2
-    reads AI-side fields from the worker's ``ai_invoice_analytics``
-    projection in the dashboard-owned Mongo instead of issuing a
-    per-request ``$in`` against the operational RecoveryHub_AI Mongo.
-    SQL steps (cohort, cancellations, process logs) are unchanged — the
-    projection only caches the AI-Mongo side. When false, behaviour is
-    identical to pre-Phase-9 (direct read from RecoveryHub_AI Mongo).
+    Mongo-first cohort (the AI data IS the process data): the cohort is the
+    set of ``ai_invoice_analytics`` projection docs in the date window —
+    every run submitted to us that entered the AI process, in whatever
+    state it currently is (in-flight, completed, failed). The SQL
+    ``AIInvoiceProcessRHTemp`` table is deliberately NOT the cohort gate:
+    it only receives a row when the AI completes a claim, which hid every
+    in-flight run from the dashboard.
+
+    Recovery Hub SQL is joined ONLY for claims that reached the review grid
+    (``line_items_save_to_rh_status`` true) — the point where the business
+    process actually hands over to Recovery Hub — to fetch the terminal
+    outcome evidence (released/cancelled process logs, cancellation
+    details). Everything before the grid is answered from the projection.
     """
     t0 = time.perf_counter()
     source_status: Dict[str, str] = {
@@ -114,103 +171,165 @@ async def _load_normalized_cohort(
     }
     data_complete = True
 
-    # 1. Query SQL cohort
-    t_sql = time.perf_counter()
+    date_field = _DATE_BASIS_TO_PROJECTION_FIELD.get(filters.date_basis)
+    if date_field is None:
+        raise ValueError(
+            "date_basis must be one of: business_status_date, claim_created_date, "
+            "ai_record_inserted_date, ai_record_updated_date"
+        )
+
+    # 1. Cohort from the projection (dashboard-owned Mongo), date-filtered.
+    t_cohort = time.perf_counter()
+    start_utc, end_utc = _utc_window_for_local_dates(filters.start_date, filters.end_date)
     try:
-        cohort_rows = sql_repo.get_ai_invoice_cohort(
-            start_date=filters.start_date,
-            end_date=filters.end_date,
+        projection_docs = await projection_repo.get_projection_cohort(
+            db_manager.db,
+            start_utc=start_utc,
+            end_utc=end_utc,
             department_id=filters.department_id,
-            date_basis=filters.date_basis,
+            date_field=date_field,
         )
     except Exception as e:
-        logger.error(f"SQL cohort query failed: {e}")
-        source_status["recoveryhub_sql"] = "unavailable"
+        logger.error(f"Projection cohort query failed: {e}")
+        source_status["recoveryhub_ai_mongo"] = "unavailable"
         return [], source_status, False
-    logger.info(f"AI analytics: SQL cohort query took {time.perf_counter() - t_sql:.3f}s ({len(cohort_rows)} rows)")
+    logger.info(f"AI analytics: projection cohort took {time.perf_counter() - t_cohort:.3f}s ({len(projection_docs)} docs)")
 
-    if not cohort_rows:
+    if not projection_docs:
         return [], source_status, True
 
-    claim_ids = [int(r["claim_id"]) for r in cohort_rows if r.get("claim_id")]
-
-    # 2. Query AI-side data — projection (Phase 9) or direct Mongo read.
-    t_ai = time.perf_counter()
-    ai_records_by_claim: Dict[int, Dict[str, Any]] = {}
-    try:
-        if settings.AI_ANALYTICS_USE_PROJECTION:
-            # Read from the dashboard-owned projection collection. The
-            # adapter maps projection fields to the raw ai_line_items
-            # shape so build_normalized_record works unchanged.
-            ai_records_by_claim = (
-                await projection_repo.get_projection_records_for_claim_ids(
-                    db_manager.db, claim_ids
-                )
-            )
-            logger.info(
-                "AI analytics: projection read took "
-                f"{time.perf_counter() - t_ai:.3f}s "
-                f"({len(ai_records_by_claim)} projections)"
-            )
-        else:
-            ai_records_by_claim = await mongo_repo.get_ai_line_items_for_claim_ids(
-                ai_db, claim_ids
-            )
-            logger.info(
-                f"AI analytics: Mongo ai_line_items query took "
-                f"{time.perf_counter() - t_ai:.3f}s "
-                f"({len(ai_records_by_claim)} records)"
-            )
-    except Exception as e:
-        logger.error(f"AI-side data query failed: {e}")
-        # The key name ``recoveryhub_ai_mongo`` is preserved for API
-        # backward compatibility — the frontend treats it as "AI-side
-        # data is unavailable". When the flag is on, the failure is
-        # actually in the dashboard-owned Mongo (the projection), but
-        # the semantic meaning to the consumer is the same: AI-side
-        # data could not be loaded.
-        source_status["recoveryhub_ai_mongo"] = "unavailable"
-        data_complete = False
-
-    # 3. Query SQL for cancellation details (batch)
-    t_canc = time.perf_counter()
-    cancellations_by_claim: Dict[int, Dict[str, Any]] = {}
-    try:
-        cancellations_by_claim = sql_repo.get_cancellation_details_for_claims(claim_ids)
-    except Exception as e:
-        logger.error(f"SQL cancellation details query failed: {e}")
-        source_status["recoveryhub_sql"] = "partial"
-        data_complete = False
-    logger.info(f"AI analytics: SQL cancellation details took {time.perf_counter() - t_canc:.3f}s ({len(cancellations_by_claim)} records)")
-
-    # 4. Query SQL for process logs (batch)
-    t_logs = time.perf_counter()
-    logs_by_claim: Dict[int, List[Dict[str, Any]]] = {}
-    try:
-        logs_by_claim = sql_repo.get_process_logs_for_claims(claim_ids)
-    except Exception as e:
-        logger.error(f"SQL process logs query failed: {e}")
-        source_status["recoveryhub_sql"] = "partial"
-        data_complete = False
-    logger.info(f"AI analytics: SQL process logs took {time.perf_counter() - t_logs:.3f}s ({len(logs_by_claim)} claims)")
-
-    # 5. Normalize in memory
+    # 2. Normalize from the projection alone — no SQL row required. The
+    #    projection carries identity (department, run number), AI state,
+    #    and step-1 output; build_normalized_record consumes a synthetic
+    #    SQL-row shape so the shared join logic is reused unchanged (DRY).
     t_norm = time.perf_counter()
     normalized: List[Dict[str, Any]] = []
-    for sql_row in cohort_rows:
-        claim_id = int(sql_row["claim_id"])
-        ai_record = ai_records_by_claim.get(claim_id)
-        cancellation = cancellations_by_claim.get(claim_id)
-        logs = logs_by_claim.get(claim_id, [])
-        record = build_normalized_record(sql_row, ai_record, cancellation, logs)
+    grid_claim_ids: List[int] = []
+    docs_by_claim: Dict[int, Dict[str, Any]] = {}
+    for doc in projection_docs:
+        claim_id = doc.get("_id")
+        try:
+            claim_id = int(claim_id)
+        except (ValueError, TypeError):
+            continue
+        if doc.get("has_ai_line_item_record") is False:
+            # Conversation-only trace — not an AI-processed run. The cohort
+            # query filters these; guarded here too so direct callers of
+            # the normalization loop stay correct.
+            continue
+        docs_by_claim[claim_id] = doc
+        ai_record = projection_repo.projection_to_ai_record(doc)
+        reached_grid = bool(ai_record.get("line_items_save_to_rh_status"))
+        if reached_grid:
+            grid_claim_ids.append(claim_id)
+        sql_row = {
+            "claim_id": claim_id,
+            "invoice_number": None,
+            "dept_id": doc.get("department_id"),
+            "department_name": doc.get("department_name"),
+            "department_state": None,
+            "run_number": doc.get("run_number"),
+            "claim_created_at": None,
+            # "Submitted to us" date, rendered in org-local terms so the
+            # trend/grouping matches the SQL-era semantics.
+            "business_status_date": _local_date_str(doc.get("ai_inserted_at")),
+            "ai_business_updated_at": _local_date_str(doc.get("ai_updated_at")),
+            # RH-side process status is intentionally None pre-grid; the
+            # outcome for those claims is derived below from the AI state.
+            "AI_inv_process_status": None,
+            "amount_invoiced": None,
+        }
+        record = build_normalized_record(sql_row, ai_record)
+        if record["business_outcome"] == "unknown":
+            # No RH terminal evidence (no released/cancelled logs, no
+            # cancellation) — the claim is still in the process, whether
+            # in flight pre-grid or sitting on the grid awaiting review.
+            # That IS pending, not unknown.
+            record["business_outcome"] = "pending"
+        record["business_record_state"] = "ai_only"
         normalized.append(record)
     logger.info(f"AI analytics: Normalization took {time.perf_counter() - t_norm:.3f}s ({len(normalized)} records)")
 
-    # 6. Attach AI eligibility — is the claim's department actually set up
+    # 3. Run lifecycle (Claims) — the same source the Claims Breakdown
+    #    buckets use, so "New runs / Active runs" here reconcile exactly
+    #    with those widgets. One indexed PK batch for the whole cohort.
+    t_life = time.perf_counter()
+    lifecycle_by_claim: Dict[int, Dict[str, Any]] = {}
+    try:
+        lifecycle_by_claim = sql_repo.get_claim_lifecycle_for_claims(
+            [r["claim_id"] for r in normalized]
+        )
+    except Exception as e:
+        logger.error(f"SQL claim lifecycle query failed: {e}")
+        source_status["recoveryhub_sql"] = "partial"
+        data_complete = False
+    for record in normalized:
+        life = lifecycle_by_claim.get(record["claim_id"], {})
+        record["run_type_id"] = life.get("type_id")
+        record["rh_claim_status"] = life.get("status")
+        record["rh_archived"] = life.get("archived")
+    logger.info(f"AI analytics: claim lifecycle took {time.perf_counter() - t_life:.3f}s ({len(lifecycle_by_claim)} claims)")
+
+    # 3. SQL enrichment — terminal outcome evidence for grid claims only.
+    t_sql = time.perf_counter()
+    if grid_claim_ids:
+        try:
+            cancellations_by_claim = sql_repo.get_cancellation_details_for_claims(grid_claim_ids)
+        except Exception as e:
+            logger.error(f"SQL cancellation details query failed: {e}")
+            cancellations_by_claim = {}
+            source_status["recoveryhub_sql"] = "partial"
+            data_complete = False
+        try:
+            logs_by_claim = sql_repo.get_process_logs_for_claims(grid_claim_ids)
+        except Exception as e:
+            logger.error(f"SQL process logs query failed: {e}")
+            logs_by_claim = {}
+            source_status["recoveryhub_sql"] = "partial"
+            data_complete = False
+        for i, record in enumerate(normalized):
+            cid = record["claim_id"]
+            if cid not in cancellations_by_claim and cid not in logs_by_claim:
+                continue
+            # Re-run the shared join with the RH evidence included so
+            # released / cancelled outcomes are classified from the
+            # authoritative log text. The synthetic SQL row is unchanged.
+            ai_record = projection_repo.projection_to_ai_record(docs_by_claim[cid])
+            enriched = build_normalized_record(
+                {
+                    "claim_id": cid,
+                    "invoice_number": None,
+                    "dept_id": record.get("department_id"),
+                    "department_name": record.get("department_name"),
+                    "department_state": record.get("department_state"),
+                    "run_number": record.get("run_number"),
+                    "claim_created_at": record.get("claim_created_at"),
+                    "business_status_date": record.get("business_status_date"),
+                    "ai_business_updated_at": record.get("ai_business_updated_at"),
+                    "AI_inv_process_status": None,
+                    "amount_invoiced": None,
+                },
+                ai_record,
+                cancellations_by_claim.get(cid),
+                logs_by_claim.get(cid, []),
+            )
+            if enriched["business_outcome"] == "unknown":
+                # Same rule as the first pass: no terminal evidence —
+                # still in the process, pending.
+                enriched["business_outcome"] = "pending"
+            enriched["business_record_state"] = record.get("business_record_state")
+            # Preserve the run-lifecycle fields attached after the first
+            # pass — the enrichment rebuild must not drop them.
+            for key in ("run_type_id", "rh_claim_status", "rh_archived"):
+                enriched[key] = record.get(key)
+            normalized[i] = enriched
+    logger.info(f"AI analytics: SQL grid enrichment took {time.perf_counter() - t_sql:.3f}s ({len(grid_claim_ids)} grid claims)")
+
+    # 4. Attach AI eligibility — is the claim's department actually set up
     # for AI billing? Done here, once, so every downstream endpoint
     # (funnel, summary, diagnostics, trend, departments) shares one
     # definition. In projection mode the department map is served from the
-    # dashboard-owned snapshot so this step, like step 2, does not depend
+    # dashboard-owned snapshot so this step, like step 1, does not depend
     # on the operational AI Mongo being reachable.
     t_elig = time.perf_counter()
     participation, fee_config_status = await resolve_participation(
@@ -399,142 +518,188 @@ async def get_outcome_funnel(
     ai_db,
     filters: AiAnalyticsFilters,
 ) -> List[AiPipelineStageStat]:
-    """Build the pipeline funnel.
+    """Build the pipeline funnel — six sections, all scoped to the period.
 
-    Every stage is a strict subset of the one before it, so the counts
-    reconcile top to bottom:
+    The cohort is Mongo-first (the projection): every run the AI touched
+    that was submitted in the date window, in its current real-time state
+    — not gated on the SQL AIInvoiceProcessRHTemp table, which only fills
+    in when a claim completes and would hide everything in-flight.
 
-    1. Claim reaches "Ready to Invoice Insurance" → row in
-       AIInvoiceProcessRHTemp (the intake cohort). The intake breakdown
-       partitions it by AI eligibility: departments with a qualifying AI
-       fee tile, departments definitively without one, and — only when
-       the fee-config source is unreachable — eligibility unknown.
-    2. Eligible for AI processing — intake minus claims in departments
-       with no qualifying tile.
-    3. Step 1 — the AI identifies the billing level/category → an
-       ai_line_items document exists. Broken down by identified level,
-       with unidentified records grouped together.
-    4. AI processing completed (COMPLETED).
-    5. Line items written back to RecoveryHub — the claim lands on the
-       review grid. Its breakdown partitions the saved cohort by grid
-       outcome: released / cancelled-rejected / still pending review, so
-       the three sum to the stage count. Released and cancelled are
-       siblings, not successive stages, so they live in the breakdown
-       rather than as stages of their own — a funnel stage must never
-       exceed the one before it.
-    6. Released — the terminal success outcome.
+    1. Step 1 — fee card & value plugged in: the billing level/category
+       the AI identified (the actual fee card: Motor Vehicle Incident
+       Level 1, Standard Response Fee, ...), with the run count and the
+       dollar value plugged into the fees & resources / fees & billables
+       area. Not all categories have levels, so there is no separate
+       "category no level" bucket — category-only runs appear under
+       their category (the card family).
+    2. AI runs submitted this period — the date-filtered cohort, split
+       by where the runs are now (still in New Runs vs moved on).
+    3. Left New Runs — claim status at handoff: runs that left New Runs
+       (ClaimCurrentTypeId ≠ 1), grouped by the RH claim status.
+    4. Human-in-the-loop grid vs elsewhere — over the runs whose AI
+       processing has FINISHED: line items saved to the review grid vs
+       handed off without it. Runs still being processed have not gone
+       anywhere yet and are in neither row.
+    5. In the HITL grid now — this period's runs currently pending
+       human review, broken down by department; the invoice drill-down
+       grid below lists them individually.
+    6. Left the HITL grid — disposition: accepted/released (with the RH
+       status) or rejected, with the normalized rejection-reason
+       breakdown that has always been used.
 
-    The saved-stage breakdown also lists cancelled records by normalized
-    rejection category ("Cancelled — <reason>"), so the funnel keeps the
-    rejection detail that used to hang off a separate cancelled stage.
+    Stage counts are not monotonically decreasing — the sections answer
+    different questions about the same period cohort. Each breakdown
+    partitions its own stage.
     """
     _validate_date_span(filters.start_date, filters.end_date)
 
     records, source_status, data_complete = await _load_normalized_cohort(ai_db, filters)
     records = _apply_filters(records, filters)
-
+    # The funnel covers ONLY the eligible cohort — the runs actually going
+    # through the AI process. Runs from departments without a qualifying
+    # AI tile never enter this pipeline (nobody processes them out of new
+    # runs through AI); they are accounted for in the summary KPI
+    # (did_not_qualify) instead of inflating the funnel stages.
+    records = qualified_records(records)
     total = len(records)
-    qualified = qualified_records(records)
 
-    eligible = sum(
-        1 for r in records if r.get("ai_eligibility") == ELIGIBILITY_ELIGIBLE
-    )
-    not_qualified = count_not_configured(records)
-    unknown = sum(
-        1 for r in records if r.get("ai_eligibility") == ELIGIBILITY_UNKNOWN
-    )
-    intake_breakdown = [
-        AiPipelineStageBreakdown(
-            label="Eligible for AI processing", count=eligible
-        ),
-        AiPipelineStageBreakdown(
-            label="Did not qualify — no qualifying AI tile",
-            count=not_qualified,
-        ),
-    ]
-    if unknown:
-        intake_breakdown.append(
-            AiPipelineStageBreakdown(
-                label="Eligibility unknown — configuration unavailable",
-                count=unknown,
-            )
-        )
+    # Run lifecycle (Claims — the same source as the Claims Breakdown
+    # buckets): ClaimCurrentTypeId 1 = New Run, 4 = Active Run.
+    def _is_active_run(r) -> bool:
+        if r.get("run_type_id") is not None:
+            return r["run_type_id"] == 4
+        # Lifecycle unavailable — fall back to the AI handoff signal.
+        return r.get("writeback_status") == "success"
 
-    # Step 1: qualified records where the AI actually evaluated the claim
-    # (an ai_line_items doc exists — the workflow ran and wrote a result).
-    evaluated = [r for r in qualified if r["ai_record_state"] == "present"]
+    active_runs = [r for r in records if _is_active_run(r)]
+    new_runs = [r for r in records if not _is_active_run(r)]
+    grid_runs = [r for r in records if r.get("writeback_status") == "success"]
+    on_grid_now = [r for r in grid_runs if r["business_outcome"] == "pending"]
+    left_grid_released = [r for r in grid_runs if r["business_outcome"] == "released"]
+    left_grid_rejected = [r for r in grid_runs if r["business_outcome"] == "cancelled_rejected"]
 
-    # Step-1 breakdown: identified billing_level values, then "Category
-    # identified (no level)" for records where step 1 produced a
-    # billing_category but no level, then "Not identified" for records
-    # where step 1 produced neither. Low-confidence identifications stay
-    # in their level row.
-    level_counts: Counter = Counter()
-    category_only = 0
-    not_identified = 0
-    for r in evaluated:
-        level = r.get("billing_level")
-        if level:
-            level_counts[str(level).strip()] += 1
-        elif r.get("billing_category"):
-            category_only += 1
-        else:
-            not_identified += 1
+    # ------------------------------------------------------------------
+    # Section 1 — Step 1 results: the fee card each run plugged into,
+    # with the run count AND the dollar value plugged into the fees &
+    # resources / fees & billables area. The card is the billing_level
+    # when the AI identified one, else the billing_category (the card
+    # family — not all categories have levels, so there is no separate
+    # "category no level" bucket).
+    # ------------------------------------------------------------------
+    card_counts: Counter = Counter()
+    card_values: Dict[str, float] = defaultdict(float)
+    for r in records:
+        card = r.get("billing_level") or r.get("billing_category")
+        if not card:
+            continue
+        card = str(card).strip()
+        card_counts[card] += 1
+        if r.get("invoice_total") is not None:
+            card_values[card] += r["invoice_total"]
     step1_breakdown = [
-        AiPipelineStageBreakdown(label=label, count=n)
-        for label, n in level_counts.most_common()
-    ]
-    if category_only:
-        step1_breakdown.append(
-            AiPipelineStageBreakdown(
-                label="Category identified (no level)", count=category_only
-            )
+        AiPipelineStageBreakdown(
+            label=card,
+            count=n,
+            value=round(card_values.get(card, 0.0), 2) or None,
         )
-    step1_breakdown.append(
-        AiPipelineStageBreakdown(label="Not identified", count=not_identified)
-    )
-
-    completed = [
-        r for r in evaluated
-        if r.get("ai_processing_status") in AI_COMPLETED_STATUSES
+        for card, n in card_counts.most_common()
     ]
 
-    # Writeback → review grid. Outcomes are drawn from the writeback
-    # cohort so released + cancelled + pending == saved.
-    writeback_records = [
-        r for r in completed if r.get("writeback_status") == "success"
+    # ------------------------------------------------------------------
+    # Section 2 — AI runs submitted THIS period (the cohort is
+    # date-filtered on the AI record's created-at, so nothing from any
+    # other period leaks in), split by where they are now.
+    # ------------------------------------------------------------------
+    submitted_breakdown = [
+        AiPipelineStageBreakdown(
+            label="Still in new runs — AI working or awaiting grid",
+            count=len(new_runs),
+        ),
+        AiPipelineStageBreakdown(
+            label="Moved on — active runs or beyond",
+            count=len(active_runs),
+        ),
     ]
-    released_records = [
-        r for r in writeback_records if r["business_outcome"] == "released"
-    ]
-    cancelled_records = [
-        r for r in writeback_records
-        if r["business_outcome"] == "cancelled_rejected"
-    ]
-    pending_in_grid = (
-        len(writeback_records) - len(released_records) - len(cancelled_records)
-    )
 
-    # Grid-outcome breakdown of the saved cohort. Cancelled records are
-    # further split by normalized rejection category, labeled with the
-    # human-readable CATEGORY_LABELS used by the UI.
+    # ------------------------------------------------------------------
+    # Section 3 — the claim status each run was given when it was
+    # released from New Runs (grouped by RH claim status; runs still in
+    # New Runs are not part of this section).
+    # ------------------------------------------------------------------
+    left_new = active_runs
+    left_new_status: Counter = Counter()
+    for r in left_new:
+        status = r.get("rh_claim_status")
+        if not status:
+            status = {
+                "released": "Released",
+                "cancelled_rejected": "Cancelled / Rejected",
+                "pending": "On review grid",
+            }.get(r["business_outcome"], "Unknown")
+        left_new_status[str(status).strip()] += 1
+    left_new_breakdown = [
+        AiPipelineStageBreakdown(label=label, count=n)
+        for label, n in left_new_status.most_common()
+    ]
+
+    # ------------------------------------------------------------------
+    # Section 4 — the two-way split over runs whose AI processing has
+    # FINISHED: line items saved to the human-in-the-loop grid vs handed
+    # off elsewhere (department takes the invoice directly / evaluated
+    # only). Runs still being processed by the AI have not gone anywhere
+    # yet and are counted in neither row.
+    # ------------------------------------------------------------------
+    finished = [r for r in records if r.get("ai_processing_status") in AI_COMPLETED_STATUSES]
+    finished_to_grid = [r for r in finished if r.get("writeback_status") == "success"]
+    hitl_breakdown = [
+        AiPipelineStageBreakdown(
+            label="Went to human-in-the-loop grid",
+            count=len(finished_to_grid),
+        ),
+        AiPipelineStageBreakdown(
+            label="Went elsewhere — finished without the review grid",
+            count=len(finished) - len(finished_to_grid),
+        ),
+    ]
+
+    # ------------------------------------------------------------------
+    # Section 5 — runs currently sitting in the HITL grid from this
+    # period's submissions (the invoice drill-down grid below lists
+    # them individually).
+    # ------------------------------------------------------------------
+    on_grid_by_dept: Counter = Counter()
+    for r in on_grid_now:
+        on_grid_by_dept[r.get("department_name") or "Unknown department"] += 1
+    on_grid_breakdown = [
+        AiPipelineStageBreakdown(label=dept, count=n)
+        for dept, n in on_grid_by_dept.most_common()
+    ]
+
+    # ------------------------------------------------------------------
+    # Section 6 — the disposition of each run when it LEFT the HITL
+    # grid: accepted/released, or rejected with the reason breakdown
+    # that has always been used.
+    # ------------------------------------------------------------------
+    left_grid_status: Counter = Counter()
+    for r in left_grid_released:
+        status = r.get("rh_claim_status")
+        left_grid_status[f"Accepted / Released — {status or 'status unknown'}"] += 1
     rejection_counts: Counter = Counter()
-    for r in cancelled_records:
+    for r in left_grid_rejected:
         rejection_counts[
             r.get("normalized_rejection_category") or "unknown"
         ] += 1
-    saved_breakdown = [
-        AiPipelineStageBreakdown(label="Released", count=len(released_records)),
-        AiPipelineStageBreakdown(
-            label="Cancelled / Rejected", count=len(cancelled_records)
-        ),
-        AiPipelineStageBreakdown(
-            label="In review grid (pending)", count=pending_in_grid
-        ),
+    left_grid_rows = [
+        AiPipelineStageBreakdown(label=label, count=n)
+        for label, n in left_grid_status.most_common()
     ]
-    saved_breakdown.extend(
+    if left_grid_rejected:
+        left_grid_rows.append(AiPipelineStageBreakdown(
+            label="Rejected", count=len(left_grid_rejected),
+        ))
+    left_grid_rows.extend(
         AiPipelineStageBreakdown(
-            label="Cancelled — "
+            label="Rejected — "
             + CATEGORY_LABELS.get(cat, cat.replace("_", " ").title()),
             count=n,
         )
@@ -543,37 +708,40 @@ async def get_outcome_funnel(
 
     stages = [
         AiPipelineStageStat(
-            stage="Reached Ready to Invoice Insurance",
+            stage="Step 1 — fee card & value plugged in",
+            count=sum(card_counts.values()),
+            description="Billing level/category the AI identified, with the invoice value plugged in",
+            breakdown=step1_breakdown or None,
+        ),
+        AiPipelineStageStat(
+            stage="AI runs submitted this period",
             count=total,
-            description="Claims in AIInvoiceProcessRHTemp",
-            breakdown=intake_breakdown,
+            description="Eligible runs the AI touched that were submitted in this period only",
+            breakdown=submitted_breakdown,
         ),
         AiPipelineStageStat(
-            stage="Eligible for AI processing",
-            count=len(qualified),
-            description="Department has a qualifying AI fee tile",
+            stage="Left New Runs — claim status at handoff",
+            count=len(left_new),
+            description="ClaimCurrentTypeId ≠ 1, grouped by the RH claim status",
+            breakdown=left_new_breakdown or None,
         ),
         AiPipelineStageStat(
-            stage="Step 1: level & category evaluated",
-            count=len(evaluated),
-            description="ai_line_items record exists — step 1 ran",
-            breakdown=step1_breakdown,
+            stage="Human-in-the-loop grid vs elsewhere",
+            count=len(finished),
+            description="Of the runs whose AI processing finished: review grid or handled without it",
+            breakdown=hitl_breakdown,
         ),
         AiPipelineStageStat(
-            stage="AI processing completed",
-            count=len(completed),
-            description="claim_processing_status = COMPLETED",
+            stage="In the HITL grid now (pending review)",
+            count=len(on_grid_now),
+            description="This period's runs currently awaiting human review — listed in the invoice grid below",
+            breakdown=on_grid_breakdown or None,
         ),
         AiPipelineStageStat(
-            stage="Line items saved to RH",
-            count=len(writeback_records),
-            description="line_items_save_to_rh_status = true — enters review grid",
-            breakdown=saved_breakdown,
-        ),
-        AiPipelineStageStat(
-            stage="Released",
-            count=len(released_records),
-            description="Invoice to Insurance - Released",
+            stage="Left the HITL grid — disposition",
+            count=len(left_grid_released) + len(left_grid_rejected),
+            description="Accepted/released or rejected (with reason breakdown)",
+            breakdown=left_grid_rows or None,
         ),
     ]
 
@@ -598,8 +766,12 @@ async def get_outcome_trend(
     # Group by time period
     period_groups: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
     date_field_by_basis = {
+        # The cohort is Mongo-first: "submitted to us" is the AI record's
+        # inserted_at rendered as an org-local date on the normalized
+        # record's business_status_date field.
         "business_status_date": "business_status_date",
-        "claim_created_date": "claim_created_at",
+        "claim_created_date": "business_status_date",
+        "ai_record_inserted_date": "business_status_date",
         "ai_record_updated_date": "ai_business_updated_at",
     }
     date_field = date_field_by_basis.get(filters.date_basis)

@@ -121,6 +121,9 @@ class AiDepartmentOutcomeStat(BaseModel):
 class AiPipelineStageBreakdown(BaseModel):
     label: str
     count: int
+    # Optional dollar total for the row (e.g. the invoice value plugged in
+    # per fee card in the step-1 breakdown). None when not applicable.
+    value: Optional[float] = None
 
 
 class AiPipelineStageStat(BaseModel):

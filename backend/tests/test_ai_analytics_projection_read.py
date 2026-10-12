@@ -252,65 +252,29 @@ class TestGetProjectionRecordsForClaimIds:
 # ---------------------------------------------------------------------------
 
 
-class TestLoadNormalizedCohortFlagGating:
-    """Verify _load_normalized_cohort uses the projection when the flag is on."""
+class TestLoadNormalizedCohortMongoFirst:
+    """The cohort is always Mongo-first (projection) — the AI data IS the
+    process data. ``AI_ANALYTICS_USE_PROJECTION`` no longer gates the
+    cohort source; it only governs the eligibility snapshot preference."""
 
     @pytest.mark.asyncio
-    async def test_flag_off_uses_direct_mongo_read(self, monkeypatch):
-        """When AI_ANALYTICS_USE_PROJECTION is false, the direct Mongo path is used."""
-        from ai_analytics.outcome_service import _load_normalized_cohort
-        from ai_analytics.models import AiAnalyticsFilters
-        from config import settings
-
-        monkeypatch.setattr(settings, "AI_ANALYTICS_USE_PROJECTION", False)
-
-        with patch(
-            "ai_analytics.outcome_service.sql_repo.get_ai_invoice_cohort"
-        ) as mock_cohort, patch(
-            "ai_analytics.outcome_service.mongo_repo.get_ai_line_items_for_claim_ids",
-            new_callable=AsyncMock,
-        ) as mock_mongo, patch(
-            "ai_analytics.outcome_service.sql_repo.get_cancellation_details_for_claims"
-        ) as mock_canc, patch(
-            "ai_analytics.outcome_service.sql_repo.get_process_logs_for_claims"
-        ) as mock_logs:
-            # Non-empty cohort so the function proceeds past the early
-            # return to the AI-side query step.
-            mock_cohort.return_value = [
-                {"claim_id": 100, "AI_inv_process_status": 4, "dept_id": 1,
-                 "department_name": "FD1", "department_state": "TX",
-                 "ai_business_updated_at": "2026-01-15T10:00:00"},
-            ]
-            mock_mongo.return_value = {}
-            mock_canc.return_value = {}
-            mock_logs.return_value = {}
-
-            filters = AiAnalyticsFilters()
-            records, source_status, data_complete = (
-                await _load_normalized_cohort(object(), filters)
-            )
-
-            assert mock_mongo.called
-            assert len(records) == 1
-
-    @pytest.mark.asyncio
-    async def test_flag_on_uses_projection_read(self, monkeypatch, mock_mongo_db):
-        """When AI_ANALYTICS_USE_PROJECTION is true, the projection path is used."""
+    async def test_cohort_comes_from_projection_regardless_of_flag(
+        self, monkeypatch, mock_mongo_db
+    ):
         from ai_analytics.outcome_service import _load_normalized_cohort
         from ai_analytics.models import AiAnalyticsFilters
         from ai_analytics_worker.config import worker_config
         from config import settings
         from database import db_manager
 
-        monkeypatch.setattr(settings, "AI_ANALYTICS_USE_PROJECTION", True)
-        # The conftest sets db_manager.db to mock_mongo_db, but we need
-        # to ensure it's the same instance the function will import.
+        monkeypatch.setattr(settings, "AI_ANALYTICS_USE_PROJECTION", False)
         monkeypatch.setattr(db_manager, "db", mock_mongo_db)
 
-        # Seed a projection into the dashboard-owned Mongo.
         collection = mock_mongo_db[worker_config.PROJECTIONS_COLLECTION]
         await collection.insert_one({
             "_id": 100,
+            "department_id": 1,
+            "department_name": "FD1",
             "ai_processing_status": "COMPLETED",
             "agent_execution_status": "success",
             "confidence_level": 90,
@@ -320,23 +284,15 @@ class TestLoadNormalizedCohortFlagGating:
             "ai_invoice_total": 1500.00,
             "processing_duration_seconds": 15.5,
             "retry_count": 2,
+            "ai_inserted_at": "2026-01-15T10:00:00",
+            "ai_updated_at": "2026-01-15T10:00:00",
         })
 
         with patch(
-            "ai_analytics.outcome_service.sql_repo.get_ai_invoice_cohort"
-        ) as mock_cohort, patch(
-            "ai_analytics.outcome_service.mongo_repo.get_ai_line_items_for_claim_ids",
-            new_callable=AsyncMock,
-        ) as mock_mongo, patch(
             "ai_analytics.outcome_service.sql_repo.get_cancellation_details_for_claims"
         ) as mock_canc, patch(
             "ai_analytics.outcome_service.sql_repo.get_process_logs_for_claims"
         ) as mock_logs:
-            mock_cohort.return_value = [
-                {"claim_id": 100, "AI_inv_process_status": 4, "dept_id": 1,
-                 "department_name": "FD1", "department_state": "TX",
-                 "ai_business_updated_at": "2026-01-15T10:00:00"},
-            ]
             mock_canc.return_value = {}
             mock_logs.return_value = {
                 100: [{"log_text": "Invoice to Insurance - Released",
@@ -347,9 +303,6 @@ class TestLoadNormalizedCohortFlagGating:
             records, source_status, data_complete = (
                 await _load_normalized_cohort(mock_mongo_db, filters)
             )
-
-            # Direct Mongo read must NOT have been called.
-            assert not mock_mongo.called
 
             # The projection data flowed through build_normalized_record.
             assert len(records) == 1
@@ -363,19 +316,16 @@ class TestLoadNormalizedCohortFlagGating:
             assert record["invoice_total"] == 1500.00
             assert record["processing_time_seconds"] == 15.5
             assert record["retry_count"] == 2
-            # business_outcome comes from the SQL join, not the projection.
+            # business_outcome comes from the SQL process logs — the only
+            # SQL touchpoint, fetched because the claim reached the grid.
             assert record["business_outcome"] == "released"
 
     @pytest.mark.asyncio
-    async def test_projection_missing_claim_treated_as_no_ai_record(
+    async def test_claims_without_projections_are_not_in_the_cohort(
         self, monkeypatch, mock_mongo_db
     ):
-        """A claim with a SQL row but no projection gets ai_record=None.
-
-        This matches the direct-read path: if there's no ai_line_items
-        document for a claim, build_normalized_record receives None and
-        sets ai_record_state="missing".
-        """
+        """The cohort IS the projection set — a claim the AI never touched
+        cannot appear (there is no SQL cohort row to admit it)."""
         from ai_analytics.outcome_service import _load_normalized_cohort
         from ai_analytics.models import AiAnalyticsFilters
         from config import settings
@@ -383,24 +333,13 @@ class TestLoadNormalizedCohortFlagGating:
 
         monkeypatch.setattr(settings, "AI_ANALYTICS_USE_PROJECTION", True)
         monkeypatch.setattr(db_manager, "db", mock_mongo_db)
-
         # No projections seeded — the projection collection is empty.
 
         with patch(
-            "ai_analytics.outcome_service.sql_repo.get_ai_invoice_cohort"
-        ) as mock_cohort, patch(
-            "ai_analytics.outcome_service.mongo_repo.get_ai_line_items_for_claim_ids",
-            new_callable=AsyncMock,
-        ) as mock_mongo, patch(
             "ai_analytics.outcome_service.sql_repo.get_cancellation_details_for_claims"
         ) as mock_canc, patch(
             "ai_analytics.outcome_service.sql_repo.get_process_logs_for_claims"
         ) as mock_logs:
-            mock_cohort.return_value = [
-                {"claim_id": 100, "AI_inv_process_status": 4, "dept_id": 1,
-                 "department_name": "FD1", "department_state": "TX",
-                 "ai_business_updated_at": "2026-01-15T10:00:00"},
-            ]
             mock_canc.return_value = {}
             mock_logs.return_value = {}
 
@@ -409,9 +348,7 @@ class TestLoadNormalizedCohortFlagGating:
                 mock_mongo_db, filters
             )
 
-            assert len(records) == 1
-            assert records[0]["ai_record_state"] == "missing"
-            assert records[0]["ai_processing_status"] is None
+            assert records == []
 
     @pytest.mark.asyncio
     async def test_projection_read_failure_marks_data_incomplete(
@@ -433,20 +370,10 @@ class TestLoadNormalizedCohortFlagGating:
         monkeypatch.setattr(db_manager, "db", failing_db)
 
         with patch(
-            "ai_analytics.outcome_service.sql_repo.get_ai_invoice_cohort"
-        ) as mock_cohort, patch(
-            "ai_analytics.outcome_service.mongo_repo.get_ai_line_items_for_claim_ids",
-            new_callable=AsyncMock,
-        ) as mock_mongo, patch(
             "ai_analytics.outcome_service.sql_repo.get_cancellation_details_for_claims"
         ) as mock_canc, patch(
             "ai_analytics.outcome_service.sql_repo.get_process_logs_for_claims"
         ) as mock_logs:
-            mock_cohort.return_value = [
-                {"claim_id": 100, "AI_inv_process_status": 4, "dept_id": 1,
-                 "department_name": "FD1", "department_state": "TX",
-                 "ai_business_updated_at": "2026-01-15T10:00:00"},
-            ]
             mock_canc.return_value = {}
             mock_logs.return_value = {}
 

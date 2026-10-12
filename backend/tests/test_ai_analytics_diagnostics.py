@@ -13,11 +13,10 @@ AUTH = {"Authorization": "Bearer valid-mock-token"}
 # ---------------------------------------------------------------------------
 
 class TestDiagnosticsService:
-    @patch("ai_analytics.outcome_service.sql_repo.get_ai_invoice_cohort")
-    @patch("ai_analytics.outcome_service.mongo_repo.get_ai_line_items_for_claim_ids", new_callable=AsyncMock)
+    @patch("ai_analytics.outcome_service.projection_repo.get_projection_cohort", new_callable=AsyncMock)
     @patch("ai_analytics.outcome_service.sql_repo.get_cancellation_details_for_claims")
     @patch("ai_analytics.outcome_service.sql_repo.get_process_logs_for_claims")
-    def test_diagnostics_summary_empty(self, mock_logs, mock_canc, mock_mongo, mock_cohort):
+    def test_diagnostics_summary_empty(self, mock_logs, mock_canc, mock_cohort):
         from ai_analytics.diagnostics_service import get_diagnostics_summary
         from ai_analytics.models import AiAnalyticsFilters
 
@@ -30,30 +29,32 @@ class TestDiagnosticsService:
         assert result.errors == 0
         assert result.avg_duration is None
 
-    @patch("ai_analytics.outcome_service.sql_repo.get_ai_invoice_cohort")
-    @patch("ai_analytics.outcome_service.mongo_repo.get_ai_line_items_for_claim_ids", new_callable=AsyncMock)
+    @patch("ai_analytics.outcome_service.projection_repo.get_projection_cohort", new_callable=AsyncMock)
     @patch("ai_analytics.outcome_service.sql_repo.get_cancellation_details_for_claims")
     @patch("ai_analytics.outcome_service.sql_repo.get_process_logs_for_claims")
-    def test_diagnostics_summary_with_data(self, mock_logs, mock_canc, mock_mongo, mock_cohort):
+    def test_diagnostics_summary_with_data(self, mock_logs, mock_canc, mock_cohort):
         from ai_analytics.diagnostics_service import get_diagnostics_summary
         from ai_analytics.models import AiAnalyticsFilters
 
+        from tests.conftest import make_projection_doc
         mock_cohort.return_value = [
-            {"claim_id": 100, "AI_inv_process_status": 4, "dept_id": 1,
-             "department_name": "FD1", "department_state": "TX",
-             "ai_business_updated_at": "2026-01-15T10:00:00"},
-            {"claim_id": 200, "AI_inv_process_status": 4, "dept_id": 1,
-             "department_name": "FD1", "department_state": "TX",
-             "ai_business_updated_at": "2026-01-16T10:00:00"},
+            make_projection_doc(
+                100,
+                sql_row={"dept_id": 1, "department_name": "FD1",
+                         "ai_business_updated_at": "2026-01-15T10:00:00"},
+                ai_record={"claim_processing_status": "COMPLETED", "agent_exec_status": "success",
+                           "confidence_level": 90, "line_items_save_to_rh_status": True,
+                           "retry_count": 0, "processing_time_seconds": 15.5},
+            ),
+            make_projection_doc(
+                200,
+                sql_row={"dept_id": 1, "department_name": "FD1",
+                         "ai_business_updated_at": "2026-01-16T10:00:00"},
+                ai_record={"claim_processing_status": "COMPLETED", "agent_exec_status": "success",
+                           "confidence_level": 30, "line_items_save_to_rh_status": False,
+                           "retry_count": 2, "processing_time_seconds": 30.0},
+            ),
         ]
-        mock_mongo.return_value = {
-            100: {"claim_processing_status": "COMPLETED", "agent_exec_status": "success",
-                  "confidence_level": 90, "line_items_save_to_rh_status": True,
-                  "retry_count": 0, "processing_time_seconds": 15.5},
-            200: {"claim_processing_status": "COMPLETED", "agent_exec_status": "success",
-                  "confidence_level": 30, "line_items_save_to_rh_status": False,
-                  "retry_count": 2, "processing_time_seconds": 30.0},
-        }
         mock_canc.return_value = {}
         mock_logs.return_value = {
             100: [{"log_text": "Invoice to Insurance - Released", "user_id": 7486, "user_type_id": 2}],
@@ -70,19 +71,26 @@ class TestDiagnosticsService:
         assert result.writeback_failures == 1  # claim 200 has writeback=False
         assert result.avg_duration == 22.75  # (15.5 + 30.0) / 2
 
-    @patch("ai_analytics.outcome_service.sql_repo.get_ai_invoice_cohort")
-    @patch("ai_analytics.outcome_service.mongo_repo.get_ai_line_items_for_claim_ids", new_callable=AsyncMock)
+    @patch("ai_analytics.outcome_service.projection_repo.get_projection_cohort", new_callable=AsyncMock)
     @patch("ai_analytics.outcome_service.sql_repo.get_cancellation_details_for_claims")
     @patch("ai_analytics.outcome_service.sql_repo.get_process_logs_for_claims")
     def test_sql_detail_failure_marks_data_incomplete(
-        self, mock_logs, mock_canc, mock_mongo, mock_cohort,
+        self, mock_logs, mock_canc, mock_cohort,
     ):
         from ai_analytics.diagnostics_service import get_diagnostics_summary
         from ai_analytics.models import AiAnalyticsFilters
         import asyncio
 
-        mock_cohort.return_value = [{"claim_id": 100, "AI_inv_process_status": 4}]
-        mock_mongo.return_value = {}
+        from tests.conftest import make_projection_doc
+        # Claim must have reached the review grid (save_to_rh True) for the
+        # SQL enrichment — the only SQL touchpoint — to be attempted.
+        mock_cohort.return_value = [
+            make_projection_doc(
+                100,
+                ai_record={"claim_processing_status": "COMPLETED",
+                           "line_items_save_to_rh_status": True},
+            ),
+        ]
         mock_canc.side_effect = RuntimeError("cancellation query failed")
         mock_logs.return_value = {}
 
@@ -98,11 +106,10 @@ class TestDiagnosticsService:
 # ---------------------------------------------------------------------------
 
 class TestDiagnosticsRoutes:
-    @patch("ai_analytics.outcome_service.sql_repo.get_ai_invoice_cohort")
-    @patch("ai_analytics.outcome_service.mongo_repo.get_ai_line_items_for_claim_ids", new_callable=AsyncMock)
+    @patch("ai_analytics.outcome_service.projection_repo.get_projection_cohort", new_callable=AsyncMock)
     @patch("ai_analytics.outcome_service.sql_repo.get_cancellation_details_for_claims")
     @patch("ai_analytics.outcome_service.sql_repo.get_process_logs_for_claims")
-    def test_diagnostics_summary_route(self, mock_logs, mock_canc, mock_mongo, mock_cohort, test_client):
+    def test_diagnostics_summary_route(self, mock_logs, mock_canc, mock_cohort, test_client):
         mock_cohort.return_value = []
         response = test_client.get("/api/ai-analytics/diagnostics/summary", headers=AUTH)
         assert response.status_code == 200
@@ -110,20 +117,20 @@ class TestDiagnosticsRoutes:
         assert data["ai_runs"] == 0
         assert data["completed"] == 0
 
-    @patch("ai_analytics.outcome_service.sql_repo.get_ai_invoice_cohort")
-    @patch("ai_analytics.outcome_service.mongo_repo.get_ai_line_items_for_claim_ids", new_callable=AsyncMock)
+    @patch("ai_analytics.outcome_service.projection_repo.get_projection_cohort", new_callable=AsyncMock)
     @patch("ai_analytics.outcome_service.sql_repo.get_cancellation_details_for_claims")
     @patch("ai_analytics.outcome_service.sql_repo.get_process_logs_for_claims")
-    def test_diagnostics_confidence_route(self, mock_logs, mock_canc, mock_mongo, mock_cohort, test_client):
+    def test_diagnostics_confidence_route(self, mock_logs, mock_canc, mock_cohort, test_client):
+        from tests.conftest import make_projection_doc
         mock_cohort.return_value = [
-            {"claim_id": 100, "AI_inv_process_status": 4, "dept_id": 1,
-             "department_name": "FD1", "department_state": "TX",
-             "ai_business_updated_at": "2026-01-15T10:00:00"},
+            make_projection_doc(
+                100,
+                sql_row={"dept_id": 1, "department_name": "FD1",
+                         "ai_business_updated_at": "2026-01-15T10:00:00"},
+                ai_record={"claim_processing_status": "COMPLETED", "confidence_level": 85,
+                           "line_items_save_to_rh_status": True},
+            ),
         ]
-        mock_mongo.return_value = {
-            100: {"claim_processing_status": "COMPLETED", "confidence_level": 85,
-                  "line_items_save_to_rh_status": True},
-        }
         mock_canc.return_value = {}
         mock_logs.return_value = {
             100: [{"log_text": "Invoice to Insurance - Released", "user_id": 7486, "user_type_id": 2}],
@@ -137,11 +144,10 @@ class TestDiagnosticsRoutes:
         assert buckets[0]["count"] == 1
         assert buckets[0]["released"] == 1
 
-    @patch("ai_analytics.outcome_service.sql_repo.get_ai_invoice_cohort")
-    @patch("ai_analytics.outcome_service.mongo_repo.get_ai_line_items_for_claim_ids", new_callable=AsyncMock)
+    @patch("ai_analytics.outcome_service.projection_repo.get_projection_cohort", new_callable=AsyncMock)
     @patch("ai_analytics.outcome_service.sql_repo.get_cancellation_details_for_claims")
     @patch("ai_analytics.outcome_service.sql_repo.get_process_logs_for_claims")
-    def test_diagnostics_retries_route(self, mock_logs, mock_canc, mock_mongo, mock_cohort, test_client):
+    def test_diagnostics_retries_route(self, mock_logs, mock_canc, mock_cohort, test_client):
         mock_cohort.return_value = []
         response = test_client.get("/api/ai-analytics/diagnostics/retries", headers=AUTH)
         assert response.status_code == 200
@@ -275,11 +281,10 @@ async def test_agent_stats_direct_path_filters_by_claim_id(mock_mongo_db):
     assert len(stats) == 1
     assert stats[0].agent == "agent-a"
 
-    @patch("ai_analytics.outcome_service.sql_repo.get_ai_invoice_cohort")
-    @patch("ai_analytics.outcome_service.mongo_repo.get_ai_line_items_for_claim_ids", new_callable=AsyncMock)
+    @patch("ai_analytics.outcome_service.projection_repo.get_projection_cohort", new_callable=AsyncMock)
     @patch("ai_analytics.outcome_service.sql_repo.get_cancellation_details_for_claims")
     @patch("ai_analytics.outcome_service.sql_repo.get_process_logs_for_claims")
-    def test_diagnostics_writeback_route(self, mock_logs, mock_canc, mock_mongo, mock_cohort, test_client):
+    def test_diagnostics_writeback_route(self, mock_logs, mock_canc, mock_cohort, test_client):
         mock_cohort.return_value = []
         response = test_client.get("/api/ai-analytics/diagnostics/writeback", headers=AUTH)
         assert response.status_code == 200
@@ -302,12 +307,11 @@ async def test_agent_stats_direct_path_filters_by_claim_id(mock_mongo_db):
 
 class TestDiagnosticsEligibility:
     @patch("ai_analytics.outcome_service.get_ai_participation_map", new_callable=AsyncMock)
-    @patch("ai_analytics.outcome_service.sql_repo.get_ai_invoice_cohort")
-    @patch("ai_analytics.outcome_service.mongo_repo.get_ai_line_items_for_claim_ids", new_callable=AsyncMock)
+    @patch("ai_analytics.outcome_service.projection_repo.get_projection_cohort", new_callable=AsyncMock)
     @patch("ai_analytics.outcome_service.sql_repo.get_cancellation_details_for_claims")
     @patch("ai_analytics.outcome_service.sql_repo.get_process_logs_for_claims")
     def test_summary_excludes_nonqualifying_records(
-        self, mock_logs, mock_canc, mock_mongo, mock_cohort, mock_part,
+        self, mock_logs, mock_canc, mock_cohort, mock_part,
     ):
         from ai_analytics.diagnostics_service import get_diagnostics_summary
         from ai_analytics.models import AiAnalyticsFilters
@@ -317,25 +321,32 @@ class TestDiagnosticsEligibility:
             1: {"uses_ai": True, "ai_mode": "auto"},
             2: {"uses_ai": False, "ai_mode": "not_using_ai"},
         }
+        from tests.conftest import make_projection_doc
         mock_cohort.return_value = [
-            {"claim_id": 100, "AI_inv_process_status": 2, "dept_id": 1,
-             "ai_business_updated_at": "2026-01-15T10:00:00"},
-            {"claim_id": 200, "AI_inv_process_status": 2, "dept_id": 2,
-             "ai_business_updated_at": "2026-01-15T10:00:00"},
-            # dept 2 claim with no AI doc — also nonqualifying
-            {"claim_id": 300, "AI_inv_process_status": 2, "dept_id": 2,
-             "ai_business_updated_at": "2026-01-15T10:00:00"},
+            make_projection_doc(
+                100,
+                sql_row={"dept_id": 1, "ai_business_updated_at": "2026-01-15T10:00:00"},
+                ai_record={"claim_processing_status": "COMPLETED",
+                           "agent_exec_status": "success",
+                           "line_items_save_to_rh_status": False,
+                           "processing_time_seconds": 10.0},
+            ),
+            make_projection_doc(
+                200,
+                sql_row={"dept_id": 2, "ai_business_updated_at": "2026-01-15T10:00:00"},
+                ai_record={"claim_processing_status": "COMPLETED",
+                           "agent_exec_status": "success",
+                           "line_items_save_to_rh_status": False,
+                           "processing_time_seconds": 99.0},
+            ),
+            # dept 2 claim with no ai_line_items doc — conversation-only
+            # trace, excluded from the Mongo-first cohort entirely.
+            make_projection_doc(
+                300,
+                sql_row={"dept_id": 2, "ai_business_updated_at": "2026-01-15T10:00:00"},
+                has_ai_line_item_record=False,
+            ),
         ]
-        mock_mongo.return_value = {
-            100: {"claim_processing_status": "COMPLETED",
-                  "agent_exec_status": "success",
-                  "line_items_save_to_rh_status": False,
-                  "processing_time_seconds": 10.0},
-            200: {"claim_processing_status": "COMPLETED",
-                  "agent_exec_status": "success",
-                  "line_items_save_to_rh_status": False,
-                  "processing_time_seconds": 99.0},
-        }
         mock_canc.return_value = {}
         mock_logs.return_value = {}
 
@@ -343,7 +354,7 @@ class TestDiagnosticsEligibility:
             get_diagnostics_summary(None, AiAnalyticsFilters())
         )
         assert result.ai_runs == 1          # only claim 100 qualifies
-        assert result.did_not_qualify == 2
+        assert result.did_not_qualify == 1  # claim 200 (dept 2); claim 300 has no AI record → not in cohort
         assert result.completed == 1
         assert result.avg_duration == 10.0  # claim 200's 99s excluded
 

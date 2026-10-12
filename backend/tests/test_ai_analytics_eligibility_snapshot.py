@@ -96,7 +96,19 @@ async def test_stale_snapshot_marks_cohort_incomplete(mock_mongo_db, monkeypatch
     monkeypatch.setattr(db_manager, "db", mock_mongo_db)
     await _seed(mock_mongo_db, age_seconds=worker_config.AI_ELIGIBILITY_SNAPSHOT_TTL_SECONDS + 5)
 
-    with patch("ai_analytics.outcome_service.sql_repo.get_ai_invoice_cohort") as cohort, patch(
+    with patch(
+        "ai_analytics.outcome_service.projection_repo.get_projection_cohort",
+        new_callable=AsyncMock,
+        return_value=[
+            {
+                "_id": 100, "department_id": 1, "department_name": "FD1",
+                "ai_processing_status": "COMPLETED",
+                "line_items_save_to_rh_status": True,
+                "ai_inserted_at": "2026-01-15T10:00:00",
+                "ai_updated_at": "2026-01-15T10:00:00",
+            },
+        ],
+    ), patch(
         "ai_analytics.outcome_service.sql_repo.get_cancellation_details_for_claims",
         return_value={},
     ), patch(
@@ -106,11 +118,6 @@ async def test_stale_snapshot_marks_cohort_incomplete(mock_mongo_db, monkeypatch
         "ai_analytics.outcome_service.get_ai_participation_map",
         new=AsyncMock(return_value=None),
     ):
-        cohort.return_value = [
-            {"claim_id": 100, "AI_inv_process_status": 4, "dept_id": 1,
-             "department_name": "FD1", "department_state": "TX",
-             "ai_business_updated_at": "2026-01-15T10:00:00"},
-        ]
         records, source_status, data_complete = await _load_normalized_cohort(
             mock_mongo_db, AiAnalyticsFilters()
         )
