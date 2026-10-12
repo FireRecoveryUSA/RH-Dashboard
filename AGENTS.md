@@ -771,3 +771,21 @@ snapshot no longer gates any funnel stage or metric.
   metrics use qualified records (eligible + unknown); diagnostics use
   qualified AI runs (`ai_record_state == "present"`);
   `did_not_qualify` counts only the definitive `not_configured` intake.
+
+## AI Outcomes Dashboard — funnel-cleanup merge (2026-10-12, PR #44)
+
+`main-work/ai-funnel-cleanup` (projection-first Mongo cohort,
+`AI_LOCAL_UTC_OFFSET_HOURS=-7` local-date windowing, HITL-grid funnel) was
+merged with main's fee-catalog work (PR #42) via PR #44. The outcome funnel
+uses the funnel-cleanup design (fee card + dollar value sections);
+`fee_identification` (fee_schedule.py catalog matching) is still attached to
+every normalized record but is not surfaced by any endpoint yet. Schema
+stays v4. `TestProjectionFallback` was removed — the hybrid SQL-cohort +
+source-refresh read path no longer exists; stale-schema projection rebuilds
+are owned by the worker's startup backfill check.
+
+The production `MONGODB_URI` (GitHub secret) points to a different Atlas
+cluster than the local `.env` one — the local cluster's
+`recoveryhub_dashboard`/`AI_FEE_CALC_MULTI_AGENT_PROD` DBs are empty or
+unrelated. Worker state cannot be inspected locally; use the app's
+`/api/ai-analytics/worker/*` endpoints (auth required) or container logs.
