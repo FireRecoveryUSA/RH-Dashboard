@@ -50,7 +50,7 @@ Architectural constraints:
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 from ai_analytics_worker.config import worker_config
 from .fee_schedule import STEP1_SOURCE_FIELDS
@@ -160,6 +160,7 @@ def projection_to_ai_record(
 async def get_projection_records_for_claim_ids(
     db: Any,
     claim_ids: List[int],
+    absent_claim_ids: Optional[Set[int]] = None,
 ) -> Dict[int, Dict[str, Any]]:
     """Fetch projection documents for a batch of claim IDs.
 
@@ -176,6 +177,14 @@ async def get_projection_records_for_claim_ids(
         db: the dashboard-owned Motor database handle (``db_manager.db``,
             NOT ``db_manager.ai_db``).
         claim_ids: the claim IDs to fetch projections for.
+        absent_claim_ids: optional caller-provided set that is populated
+            with the claim IDs whose *current-schema* projection
+            explicitly records ``has_ai_line_item_record=false``. Lets
+            callers distinguish "no projection / stale projection"
+            (refresh from source) from "authoritative negative
+            projection" (keep ``missing``; the source read would return
+            nothing anyway). Stale negative projections are not added —
+            they still warrant a source refresh.
 
     Returns:
         Dict mapping ``claim_id`` (int) → adapted ai_record dict.
@@ -203,6 +212,15 @@ async def get_projection_records_for_claim_ids(
         if claim_id is None:
             continue
         if not doc.get("has_ai_line_item_record", True):
+            if (
+                absent_claim_ids is not None
+                and doc.get("projection_schema_version", 0)
+                >= worker_config.projection_schema_version
+            ):
+                try:
+                    absent_claim_ids.add(int(claim_id))
+                except (ValueError, TypeError):
+                    pass
             continue
         try:
             cid = int(claim_id)

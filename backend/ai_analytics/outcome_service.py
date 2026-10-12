@@ -143,9 +143,10 @@ async def _load_normalized_cohort(
             # Read from the dashboard-owned projection collection. The
             # adapter maps projection fields to the raw ai_line_items
             # shape so build_normalized_record works unchanged.
+            absent_projection_ids: set[int] = set()
             ai_records_by_claim = (
                 await projection_repo.get_projection_records_for_claim_ids(
-                    db_manager.db, claim_ids
+                    db_manager.db, claim_ids, absent_projection_ids
                 )
             )
             logger.info(
@@ -159,16 +160,34 @@ async def _load_normalized_cohort(
             # fields don't silently degrade step 1. Projections at the
             # current schema version trigger no source read. The source
             # is never written and no inline projection write occurs —
-            # the worker backfill owns rebuilding projections.
+            # the worker backfill owns rebuilding projections. Claims
+            # whose current-schema projection explicitly records
+            # ``has_ai_line_item_record=false`` are excluded: the source
+            # read would return nothing for them, so they stay
+            # ``missing`` without re-querying operational Mongo on every
+            # request.
             refresh_ids = [
                 cid
                 for cid in claim_ids
-                if cid not in ai_records_by_claim
-                or not isinstance(
-                    ai_records_by_claim[cid].get("_projection_schema_version"),
-                    int,
+                if (
+                    cid not in ai_records_by_claim
+                    and cid not in absent_projection_ids
                 )
-                or ai_records_by_claim[cid]["_projection_schema_version"] < 4
+                or (
+                    cid in ai_records_by_claim
+                    and (
+                        not isinstance(
+                            ai_records_by_claim[cid].get(
+                                "_projection_schema_version"
+                            ),
+                            int,
+                        )
+                        or ai_records_by_claim[cid][
+                            "_projection_schema_version"
+                        ]
+                        < 4
+                    )
+                )
             ]
             if refresh_ids:
                 try:
