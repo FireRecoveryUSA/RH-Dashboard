@@ -851,6 +851,55 @@ class TestAiEligibilityGating:
     @patch("ai_analytics.outcome_service.projection_repo.get_projection_cohort", new_callable=AsyncMock)
     @patch("ai_analytics.outcome_service.sql_repo.get_cancellation_details_for_claims")
     @patch("ai_analytics.outcome_service.sql_repo.get_process_logs_for_claims")
+    async def test_funnel_step1_counts_every_eligible_run(
+        self, mock_logs, mock_canc, mock_cohort, mock_part, mock_life, test_client,
+    ):
+        """Invariant: the step-1 stage count equals the eligible cohort —
+        every AI-eligible run was submitted to step 1. Runs where the AI
+        identified no fee card land in the explicit 'No fee card
+        identified' bucket instead of being dropped from the count."""
+        mock_part.return_value = _participation()
+        from tests.conftest import make_projection_doc
+        mock_cohort.return_value = [
+            make_projection_doc(
+                100, sql_row={"dept_id": 1,
+                              "ai_business_updated_at": "2026-01-15T10:00:00"},
+                ai_record={"claim_processing_status": "COMPLETED",
+                           "billing_category": "Structure Fires",
+                           "line_items_save_to_rh_status": True},
+            ),
+            # No billing_level AND no billing_category — previously
+            # dropped from the step-1 count entirely.
+            make_projection_doc(
+                200, sql_row={"dept_id": 1,
+                              "ai_business_updated_at": "2026-01-15T10:00:00"},
+                ai_record={"claim_processing_status": "INITIATED",
+                           "agent_exec_status": "in_progress",
+                           "line_items_save_to_rh_status": False},
+            ),
+        ]
+        mock_life.return_value = {}
+        mock_canc.return_value = {}
+        mock_logs.return_value = {}
+
+        response = test_client.get("/api/ai-analytics/outcomes/funnel", headers=AUTH)
+        assert response.status_code == 200
+        stages = response.json()
+        # Stage 1 counts BOTH runs — the card-less one is bucketed, not
+        # dropped — so it equals the eligible cohort (stage 2 count).
+        assert stages[0]["count"] == 2
+        assert stages[1]["count"] == 2
+        breakdown = {b["label"]: b["count"] for b in stages[0]["breakdown"]}
+        assert breakdown["Structure Fires"] == 1
+        assert breakdown["No fee card identified"] == 1
+        assert sum(breakdown.values()) == stages[0]["count"]
+
+    @pytest.mark.asyncio
+    @patch("ai_analytics.outcome_service.sql_repo.get_claim_lifecycle_for_claims")
+    @patch("ai_analytics.outcome_service.get_ai_participation_map", new_callable=AsyncMock)
+    @patch("ai_analytics.outcome_service.projection_repo.get_projection_cohort", new_callable=AsyncMock)
+    @patch("ai_analytics.outcome_service.sql_repo.get_cancellation_details_for_claims")
+    @patch("ai_analytics.outcome_service.sql_repo.get_process_logs_for_claims")
     def test_participation_unavailable_marks_unknown_not_disqualified(
         self, mock_logs, mock_canc, mock_cohort, mock_part, mock_life, test_client,
     ):

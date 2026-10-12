@@ -539,7 +539,10 @@ async def get_outcome_funnel(
        dollar value plugged into the fees & resources / fees & billables
        area. Not all categories have levels, so there is no separate
        "category no level" bucket — category-only runs appear under
-       their category (the card family).
+       their category (the card family). Every eligible run is counted:
+       runs where the AI identified no card at all land in the "No fee
+       card identified" bucket, so this stage's count always equals the
+       eligible cohort.
     2. AI runs submitted this period — the date-filtered cohort, split
        by where the runs are now (still in New Runs vs moved on).
     3. Left New Runs — claim status at handoff: runs that left New Runs
@@ -592,13 +595,19 @@ async def get_outcome_funnel(
     # resources / fees & billables area. The card is the billing_level
     # when the AI identified one, else the billing_category (the card
     # family — not all categories have levels, so there is no separate
-    # "category no level" bucket).
+    # "category no level" bucket). Every eligible run submitted to step 1
+    # is counted: runs where the AI identified no card at all land in the
+    # explicit "No fee card identified" bucket, so the stage count always
+    # equals the eligible cohort (invariant carried over from the
+    # pre-cleanup funnel).
     # ------------------------------------------------------------------
     card_counts: Counter = Counter()
     card_values: Dict[str, float] = defaultdict(float)
+    no_card = 0
     for r in records:
         card = r.get("billing_level") or r.get("billing_category")
         if not card:
+            no_card += 1
             continue
         card = str(card).strip()
         card_counts[card] += 1
@@ -612,6 +621,10 @@ async def get_outcome_funnel(
         )
         for card, n in card_counts.most_common()
     ]
+    if no_card:
+        step1_breakdown.append(
+            AiPipelineStageBreakdown(label="No fee card identified", count=no_card)
+        )
 
     # ------------------------------------------------------------------
     # Section 2 — AI runs submitted THIS period (the cohort is
@@ -717,8 +730,8 @@ async def get_outcome_funnel(
     stages = [
         AiPipelineStageStat(
             stage="Step 1 — fee card & value plugged in",
-            count=sum(card_counts.values()),
-            description="Billing level/category the AI identified, with the invoice value plugged in",
+            count=len(records),
+            description="Billing level/category the AI identified, with the invoice value plugged in; runs with no identified card are bucketed separately",
             breakdown=step1_breakdown or None,
         ),
         AiPipelineStageStat(
