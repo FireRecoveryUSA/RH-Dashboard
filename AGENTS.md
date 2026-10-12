@@ -525,11 +525,19 @@ top to bottom (`test_funnel_cancelled_outcome` asserts monotonicity):
    unknown). This replaced the former "Marked for AI billing"
    (`dept_send_auto_invoice_status = 2`) stage: the legacy flag no longer
    gates anything.
-3. **Step 1: level & category evaluated** — an `ai_line_items` doc exists.
-   `breakdown` lists each identified `billing_level` value, then
-   "Category identified (no level)" (`billing_category` set, no level), then
-   "Not identified" (neither). Low-confidence identifications stay in their
-   level row (`level_identification_low_confidence`).
+3. **Step 1: category & fee item results** — an `ai_line_items` doc exists
+   (record presence, not verified successful evaluation). `breakdown` lists
+   one row per distinct step-1 result — `(label, match_status,
+   description)` — from `ai_analytics.fee_schedule.identify_fee_result`,
+   which matches `billing_category`/`billing_level`/`level_label_matched`
+   against the department's current fee catalog (case/whitespace only; a
+   `billing_level` value may be a fee *item* name, not a numbered level).
+   The catalog rides on the participation map
+   (`get_ai_participation_map`); unavailable or ambiguous catalogs keep the
+   raw source label. `match_status` is one of `matched`,
+   `category_matched`, `ambiguous`, `unmatched`,
+   `configuration_unavailable`, `configuration_ambiguous`,
+   `not_identified`.
 4. **AI processing completed** — `COMPLETED` within the evaluated cohort.
 5. **Line items saved to RH** — `line_items_save_to_rh_status = true`;
    this is what lands the claim on the review grid. `breakdown` partitions
@@ -570,22 +578,34 @@ metric any more; they are documented so nobody reintroduces them:
   review), not an AI yes/no flag.
 - **`Claims.is_truck_claim_AI`** — unrelated truck-claim feature.
 
-### New ai_line_items fields (schema v3)
+### New ai_line_items fields (schema v3 → v4)
 
 `billing_level`, `level_identification_confidence`,
 `level_identification_low_confidence`, `level_identification_reasoning`
-appeared ~2026-09 (the step-1 level-identification output; ~200 docs at
-review time, only for departments whose fee schedules define levels).
+appeared ~2026-09 (the step-1 identification output; ~200 docs at review
+time, only for departments whose fee schedules define levels).
 `is_cancelled`, `cancellation_reason`, `cancelled_on`,
 `is_invoice_sent_manually`, `sent_invoice_manually_on`,
-`lineitems_edited*` also exist on newer docs. Wired through
-`SUMMARY_PROJECTION`, `build_normalized_record`, the worker projection
-(schema v3), and `_PASSTHROUGH_FIELDS`/`_TRACE_PASSTHROUGH_FIELDS`.
+`lineitems_edited*` also exist on newer source docs. Schema v3 preserves
+`is_cancelled` and `cancellation_reason`; the other source fields are not
+all included in the dashboard projection. Schema v4 adds the intake
+evidence fields
+`intake_status`, `intake_evaluated_at`, `intake_evaluation_count`, and
+`level_label_matched`. Only the step-1 identification + intake fields
+(`billing_level`, `level_identification_confidence` /
+`level_identification_low_confidence` / `level_identification_reasoning`,
+`intake_status`, `intake_evaluated_at`, `intake_evaluation_count`,
+`level_label_matched`) are wired through `SUMMARY_PROJECTION`,
+`build_normalized_record`, the worker projection, and
+`_PASSTHROUGH_FIELDS`/`_TRACE_PASSTHROUGH_FIELDS` via the single
+`STEP1_SOURCE_FIELDS` tuple in `ai_analytics/fee_schedule.py`.
 
-**v1/v2 projections lack these fields** — until a backfill rewrites them,
-projection mode reports everything "Not identified" / "Send mode unknown"
-in the funnel breakdowns. Run `ai_analytics_worker.backfill.run_backfill`
-after deploying schema v3.
+**Pre-v4 projections lack the intake fields** — until the automatic
+startup backfill (`main._run_worker_backfill_if_needed`, triggered by the
+schema-version bump) rewrites them, the projection read path refreshes
+missing/pre-v4 claims with one batched source read per request and marks
+`source_status.recoveryhub_ai_projection` `"refreshing"` (or `"partial"`
+if that read fails, keeping the old projection data).
 
 ### Bugs fixed (2026-09-12)
 
@@ -684,7 +704,11 @@ snapshot no longer gates any funnel stage or metric.
   touching RecoveryHub_AI Mongo; an expired one is refreshed from the
   source, and if that fails the stale map is served with
   `recoveryhub_ai_fee_config="stale"`. Direct mode always reads the
-  source and rewrites the snapshot.
+  source and rewrites the snapshot. Snapshot docs carry
+  `schema_version` (currently 2); v1 snapshots predate the fee catalog
+  entries (`fee_catalog`/`fee_catalog_version`, used for step-1 result
+  matching) so they are treated as expired immediately while remaining
+  the stale fallback.
 - **Historical rescue**: a normalized writeback `success` or a
   `released`/`cancelled_rejected` outcome proves the claim was eligible
   when it ran and overrides the current (possibly disabled) tile config.

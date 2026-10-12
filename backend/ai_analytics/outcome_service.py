@@ -57,6 +57,7 @@ from .normalization_core import (
     ELIGIBILITY_NOT_CONFIGURED,
     ELIGIBILITY_UNKNOWN,
 )
+from .fee_schedule import identify_fee_result
 from .reason_normalization import normalize_reason, CATEGORY_LABELS
 from .eligibility_snapshot import (
     STATUS_STALE as ELIGIBILITY_STATUS_STALE,
@@ -142,9 +143,10 @@ async def _load_normalized_cohort(
             # Read from the dashboard-owned projection collection. The
             # adapter maps projection fields to the raw ai_line_items
             # shape so build_normalized_record works unchanged.
+            absent_projection_ids: set[int] = set()
             ai_records_by_claim = (
                 await projection_repo.get_projection_records_for_claim_ids(
-                    db_manager.db, claim_ids
+                    db_manager.db, claim_ids, absent_projection_ids
                 )
             )
             logger.info(
@@ -152,6 +154,56 @@ async def _load_normalized_cohort(
                 f"{time.perf_counter() - t_ai:.3f}s "
                 f"({len(ai_records_by_claim)} projections)"
             )
+            # Claims with no projection, or a projection built under an
+            # older schema version, get one batched summary read against
+            # the operational source so missing intake/identification
+            # fields don't silently degrade step 1. Projections at the
+            # current schema version trigger no source read. The source
+            # is never written and no inline projection write occurs —
+            # the worker backfill owns rebuilding projections. Claims
+            # whose current-schema projection explicitly records
+            # ``has_ai_line_item_record=false`` are excluded: the source
+            # read would return nothing for them, so they stay
+            # ``missing`` without re-querying operational Mongo on every
+            # request.
+            refresh_ids = [
+                cid
+                for cid in claim_ids
+                if (
+                    cid not in ai_records_by_claim
+                    and cid not in absent_projection_ids
+                )
+                or (
+                    cid in ai_records_by_claim
+                    and (
+                        not isinstance(
+                            ai_records_by_claim[cid].get(
+                                "_projection_schema_version"
+                            ),
+                            int,
+                        )
+                        or ai_records_by_claim[cid][
+                            "_projection_schema_version"
+                        ]
+                        < 4
+                    )
+                )
+            ]
+            if refresh_ids:
+                try:
+                    current = await mongo_repo.get_ai_line_items_for_claim_ids(
+                        ai_db, refresh_ids
+                    )
+                    for cid in refresh_ids:
+                        ai_records_by_claim.pop(cid, None)
+                    ai_records_by_claim.update(current)
+                    source_status["recoveryhub_ai_projection"] = "refreshing"
+                except Exception as exc:
+                    logger.warning(
+                        "AI projection fallback unavailable: %r", exc
+                    )
+                    source_status["recoveryhub_ai_projection"] = "partial"
+                    data_complete = False
         else:
             ai_records_by_claim = await mongo_repo.get_ai_line_items_for_claim_ids(
                 ai_db, claim_ids
@@ -234,15 +286,22 @@ async def _load_normalized_cohort(
     for record in normalized:
         dept_id = record.get("department_id")
         dept_uses_ai: Optional[bool] = None
-        if participation is not None:
-            info = participation.get(
-                int(dept_id) if dept_id is not None else None
-            )
-            dept_uses_ai = bool(info and info.get("uses_ai"))
+        info: Optional[Dict[str, Any]] = None
+        if participation is not None and dept_id is not None:
+            info = participation.get(int(dept_id))
+            # uses_ai=None means conflicting finalized schedules —
+            # preserve it as unknown rather than bool-coercing to
+            # not_configured. A missing department id stays unknown.
+            dept_uses_ai = info.get("uses_ai") if info else False
         record["ai_eligibility"] = classify_ai_eligibility(
             dept_uses_ai=dept_uses_ai,
             writeback_status=record.get("writeback_status"),
             business_outcome=record.get("business_outcome"),
+        )
+        # Step-1 result described against this department's current fee
+        # catalog (when the participation map carries one).
+        record["fee_identification"] = identify_fee_result(
+            record, info, fee_config_status
         )
     logger.info(
         f"AI analytics: Eligibility classification took "
@@ -411,9 +470,13 @@ async def get_outcome_funnel(
        the fee-config source is unreachable — eligibility unknown.
     2. Eligible for AI processing — intake minus claims in departments
        with no qualifying tile.
-    3. Step 1 — the AI identifies the billing level/category → an
-       ai_line_items document exists. Broken down by identified level,
-       with unidentified records grouped together.
+    3. Step 1 — an ``ai_line_items`` document exists (the workflow ran and
+       produced a record — presence, not successful identification). The
+       breakdown groups records by their step-1 identification result:
+       the category/fee-item label matched against the department's
+       current fee catalog, plus the match status and detail. Records
+       whose catalog is unavailable or ambiguous keep their raw source
+       label rather than being collapsed into a generic bucket.
     4. AI processing completed (COMPLETED).
     5. Line items written back to RecoveryHub — the claim lands on the
        review grid. Its breakdown partitions the saved cohort by grid
@@ -460,39 +523,28 @@ async def get_outcome_funnel(
             )
         )
 
-    # Step 1: qualified records where the AI actually evaluated the claim
-    # (an ai_line_items doc exists — the workflow ran and wrote a result).
+    # Step 1: qualified records where the AI produced a result record —
+    # an ai_line_items doc exists (existence, not verified successful
+    # identification; the breakdown carries the result detail).
     evaluated = [r for r in qualified if r["ai_record_state"] == "present"]
 
-    # Step-1 breakdown: identified billing_level values, then "Category
-    # identified (no level)" for records where step 1 produced a
-    # billing_category but no level, then "Not identified" for records
-    # where step 1 produced neither. Low-confidence identifications stay
-    # in their level row.
-    level_counts: Counter = Counter()
-    category_only = 0
-    not_identified = 0
+    # Step-1 breakdown: one row per distinct identification result —
+    # (label, match_status, description) — so actual fee schedule
+    # categories and items are shown instead of a generic "Category
+    # identified" row. Counts sum exactly to the evaluated count; there
+    # is no phantom "Not identified" row when everything identified.
+    result_counts: Counter = Counter()
     for r in evaluated:
-        level = r.get("billing_level")
-        if level:
-            level_counts[str(level).strip()] += 1
-        elif r.get("billing_category"):
-            category_only += 1
-        else:
-            not_identified += 1
+        fi = r.get("fee_identification") or identify_fee_result(r, None)
+        result_counts[
+            (fi["label"], fi["match_status"], fi["description"])
+        ] += 1
     step1_breakdown = [
-        AiPipelineStageBreakdown(label=label, count=n)
-        for label, n in level_counts.most_common()
-    ]
-    if category_only:
-        step1_breakdown.append(
-            AiPipelineStageBreakdown(
-                label="Category identified (no level)", count=category_only
-            )
+        AiPipelineStageBreakdown(
+            label=label, count=n, match_status=status, description=desc
         )
-    step1_breakdown.append(
-        AiPipelineStageBreakdown(label="Not identified", count=not_identified)
-    )
+        for (label, status, desc), n in result_counts.most_common()
+    ]
 
     completed = [
         r for r in evaluated
@@ -554,9 +606,9 @@ async def get_outcome_funnel(
             description="Department has a qualifying AI fee tile",
         ),
         AiPipelineStageStat(
-            stage="Step 1: level & category evaluated",
+            stage="Step 1: category & fee item results",
             count=len(evaluated),
-            description="ai_line_items record exists — step 1 ran",
+            description="AI records grouped by category and fee item. Levels apply only where defined in the department fee schedule.",
             breakdown=step1_breakdown,
         ),
         AiPipelineStageStat(

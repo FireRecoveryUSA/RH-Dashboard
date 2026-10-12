@@ -129,13 +129,21 @@ class TestProjectionToAiRecord:
             "claim_processing_status", "agent_exec_status",
             "invoice_total", "processing_time_seconds",
             "thread_id", "retry_thread_id",
-            "billing_level", "level_identification_confidence",
-            "level_identification_low_confidence",
             "dept_send_auto_invoice_status",
             "is_cancelled", "cancellation_reason",
+            "billing_level", "level_identification_confidence",
+            "level_identification_low_confidence",
+            "level_identification_reasoning",
+            "intake_status", "intake_evaluated_at",
+            "intake_evaluation_count", "level_label_matched",
+            "_projection_schema_version",
         }
         assert set(result.keys()) == expected_keys
-        assert all(v is None for v in result.values())
+        assert all(
+            v is None for k, v in result.items()
+            if k != "_projection_schema_version"
+        )
+        assert result["_projection_schema_version"] == 0
 
     def test_full_projection_maps_all_fields(self):
         """A complete projection maps every field build_normalized_record reads."""
@@ -166,10 +174,22 @@ class TestProjectionToAiRecord:
             "billing_level": None,
             "level_identification_confidence": None,
             "level_identification_low_confidence": None,
+            "level_identification_reasoning": None,
+            "intake_status": None,
+            "intake_evaluated_at": None,
+            "intake_evaluation_count": None,
+            "level_label_matched": None,
             "dept_send_auto_invoice_status": None,
             "is_cancelled": None,
             "cancellation_reason": None,
+            "_projection_schema_version": 0,
         }
+
+    def test_internal_schema_version_passthrough(self):
+        """The projection's schema version rides along so the cohort loader
+        can detect outdated projections for source refresh."""
+        result = projection_to_ai_record({"projection_schema_version": 4})
+        assert result["_projection_schema_version"] == 4
 
 
 # ---------------------------------------------------------------------------
@@ -311,6 +331,7 @@ class TestLoadNormalizedCohortFlagGating:
         collection = mock_mongo_db[worker_config.PROJECTIONS_COLLECTION]
         await collection.insert_one({
             "_id": 100,
+            "projection_schema_version": worker_config.projection_schema_version,
             "ai_processing_status": "COMPLETED",
             "agent_execution_status": "success",
             "confidence_level": 90,
@@ -401,6 +422,9 @@ class TestLoadNormalizedCohortFlagGating:
                  "department_name": "FD1", "department_state": "TX",
                  "ai_business_updated_at": "2026-01-15T10:00:00"},
             ]
+            # No projection → one batched source read; the source also has
+            # no doc for this claim, so it stays "missing".
+            mock_mongo.return_value = {}
             mock_canc.return_value = {}
             mock_logs.return_value = {}
 
@@ -457,6 +481,171 @@ class TestLoadNormalizedCohortFlagGating:
 
             assert source_status["recoveryhub_ai_mongo"] == "unavailable"
             assert data_complete is False
+
+
+# ---------------------------------------------------------------------------
+# _load_normalized_cohort — schema-version fallback to the source
+# ---------------------------------------------------------------------------
+
+
+def _cohort_row(claim_id):
+    return {
+        "claim_id": claim_id, "AI_inv_process_status": 4, "dept_id": 1,
+        "department_name": "FD1", "department_state": "TX",
+        "ai_business_updated_at": "2026-01-15T10:00:00",
+    }
+
+
+class TestProjectionFallback:
+    """Missing or pre-v4 projections get one batched source read so newer
+    step-1 fields are available; mature v4 projections trigger none."""
+
+    def _patches(self):
+        """Context manager patching the cohort sources; yields
+        (mock_cohort, mock_mongo)."""
+        from contextlib import contextmanager
+
+        @contextmanager
+        def _ctx():
+            with patch(
+                "ai_analytics.outcome_service.sql_repo.get_ai_invoice_cohort"
+            ) as mock_cohort, patch(
+                "ai_analytics.outcome_service.mongo_repo"
+                ".get_ai_line_items_for_claim_ids",
+                new_callable=AsyncMock,
+            ) as mock_mongo, patch(
+                "ai_analytics.outcome_service.sql_repo"
+                ".get_cancellation_details_for_claims",
+                return_value={},
+            ), patch(
+                "ai_analytics.outcome_service.sql_repo"
+                ".get_process_logs_for_claims",
+                return_value={},
+            ):
+                yield mock_cohort, mock_mongo
+
+        return _ctx()
+
+    @pytest.mark.asyncio
+    async def test_missing_and_old_schema_refresh_from_source(
+        self, monkeypatch, mock_mongo_db
+    ):
+        from ai_analytics.outcome_service import _load_normalized_cohort
+        from ai_analytics.models import AiAnalyticsFilters
+        from ai_analytics_worker.config import worker_config
+        from config import settings
+        from database import db_manager
+
+        monkeypatch.setattr(settings, "AI_ANALYTICS_USE_PROJECTION", True)
+        monkeypatch.setattr(db_manager, "db", mock_mongo_db)
+
+        collection = mock_mongo_db[worker_config.PROJECTIONS_COLLECTION]
+        await collection.insert_one({
+            "_id": 100,
+            "projection_schema_version": 3,  # outdated — no intake fields
+            "ai_processing_status": "COMPLETED",
+            "billing_category": "Old Category",
+        })
+        # Claim 200 has no projection at all.
+
+        with self._patches() as (mock_cohort, mock_mongo):
+            mock_cohort.return_value = [_cohort_row(100), _cohort_row(200)]
+            mock_mongo.return_value = {
+                100: {
+                    "claim_id": 100,
+                    "claim_processing_status": "COMPLETED",
+                    "billing_category": "Fresh Category",
+                    "intake_status": "IDENTIFIED",
+                },
+                200: {
+                    "claim_id": 200,
+                    "claim_processing_status": "COMPLETED",
+                    "billing_category": "Recovered",
+                },
+            }
+
+            records, source_status, data_complete = (
+                await _load_normalized_cohort(mock_mongo_db, AiAnalyticsFilters())
+            )
+
+        mock_mongo.assert_awaited_once()
+        refreshed_ids = set(mock_mongo.await_args.args[1])
+        assert refreshed_ids == {100, 200}
+        assert source_status["recoveryhub_ai_projection"] == "refreshing"
+        by_id = {r["claim_id"]: r for r in records}
+        # The old projection's stale value is replaced by the source doc.
+        assert by_id[100]["billing_category"] == "Fresh Category"
+        assert by_id[100]["intake_status"] == "IDENTIFIED"
+        assert by_id[200]["billing_category"] == "Recovered"
+
+    @pytest.mark.asyncio
+    async def test_source_failure_retains_old_projection_and_marks_partial(
+        self, monkeypatch, mock_mongo_db
+    ):
+        from ai_analytics.outcome_service import _load_normalized_cohort
+        from ai_analytics.models import AiAnalyticsFilters
+        from ai_analytics_worker.config import worker_config
+        from config import settings
+        from database import db_manager
+
+        monkeypatch.setattr(settings, "AI_ANALYTICS_USE_PROJECTION", True)
+        monkeypatch.setattr(db_manager, "db", mock_mongo_db)
+
+        collection = mock_mongo_db[worker_config.PROJECTIONS_COLLECTION]
+        await collection.insert_one({
+            "_id": 100,
+            "projection_schema_version": 3,
+            "ai_processing_status": "COMPLETED",
+            "billing_category": "Old Category",
+        })
+
+        with self._patches() as (mock_cohort, mock_mongo):
+            mock_cohort.return_value = [_cohort_row(100)]
+            mock_mongo.side_effect = RuntimeError("ai mongo down")
+
+            records, source_status, data_complete = (
+                await _load_normalized_cohort(mock_mongo_db, AiAnalyticsFilters())
+            )
+
+        assert source_status["recoveryhub_ai_projection"] == "partial"
+        assert data_complete is False
+        # The old projection data is retained, not dropped.
+        assert records[0]["billing_category"] == "Old Category"
+        assert records[0]["ai_processing_status"] == "COMPLETED"
+
+    @pytest.mark.asyncio
+    async def test_current_schema_projection_needs_no_source_read(
+        self, monkeypatch, mock_mongo_db
+    ):
+        from ai_analytics.outcome_service import _load_normalized_cohort
+        from ai_analytics.models import AiAnalyticsFilters
+        from ai_analytics_worker.config import worker_config
+        from config import settings
+        from database import db_manager
+
+        monkeypatch.setattr(settings, "AI_ANALYTICS_USE_PROJECTION", True)
+        monkeypatch.setattr(db_manager, "db", mock_mongo_db)
+
+        collection = mock_mongo_db[worker_config.PROJECTIONS_COLLECTION]
+        await collection.insert_one({
+            "_id": 100,
+            "projection_schema_version": worker_config.projection_schema_version,
+            "ai_processing_status": "COMPLETED",
+            "billing_category": "Current Category",
+            "intake_status": "IDENTIFIED",
+        })
+
+        with self._patches() as (mock_cohort, mock_mongo):
+            mock_cohort.return_value = [_cohort_row(100)]
+
+            records, source_status, data_complete = (
+                await _load_normalized_cohort(mock_mongo_db, AiAnalyticsFilters())
+            )
+
+        mock_mongo.assert_not_awaited()
+        assert "recoveryhub_ai_projection" not in source_status
+        assert records[0]["billing_category"] == "Current Category"
+        assert records[0]["intake_status"] == "IDENTIFIED"
 
 
 # ---------------------------------------------------------------------------

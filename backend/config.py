@@ -115,8 +115,13 @@ class Settings:
     # v2 (Phase 10): adds ``resources`` to line item entries, adds
     # ``conversation_summaries`` (per-conversation summary list), adds
     # ``conversation_id`` and ``thread_id_is_billable`` from ai_line_items.
+    # v4: adds the step-1 intake/identification evidence fields
+    # (``ai_analytics.fee_schedule.STEP1_SOURCE_FIELDS`` — intake_status,
+    # intake_evaluated_at, intake_evaluation_count, level_label_matched,
+    # level_identification_reasoning). The startup backfill hook rebuilds
+    # older projections.
     AI_ANALYTICS_WORKER_PROJECTION_SCHEMA_VERSION: int = int(
-        os.getenv("AI_ANALYTICS_WORKER_PROJECTION_SCHEMA_VERSION", "3")
+        os.getenv("AI_ANALYTICS_WORKER_PROJECTION_SCHEMA_VERSION", "4")
     )
     # Coalescing debounce window (seconds). Multiple change events for the same
     # claim within this window collapse into a single refresh (Phase 6/8).

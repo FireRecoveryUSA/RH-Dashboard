@@ -577,3 +577,240 @@ class TestClassifyAiEligibility:
         assert classify_ai_eligibility(
             False, business_outcome="pending"
         ) == ELIGIBILITY_NOT_CONFIGURED
+
+
+# ---------------------------------------------------------------------------
+# Step-1 fee schedule matching (ai_analytics.fee_schedule)
+# ---------------------------------------------------------------------------
+
+from ai_analytics.fee_schedule import (
+    FEE_CATALOG_VERSION,
+    compact_fee_catalog,
+    identify_fee_result,
+    step1_source_fields,
+)
+
+
+def _dept(catalog):
+    return {"fee_catalog_version": FEE_CATALOG_VERSION, "fee_catalog": catalog}
+
+
+class TestCompactFeeCatalog:
+    def test_keeps_only_match_fields(self):
+        fees = [
+            {
+                "item": " Vehicle Fire ",
+                "fee_category": "Structure  Fires",
+                "fee_label_from_document": "Vehicle fire",
+                "use_in_ai_process": True,
+                "resources": [{"name": "Engine"}],
+            },
+            {"item": ""},  # no item or category → dropped
+            "not a dict",
+        ]
+        assert compact_fee_catalog(fees) == [
+            {
+                "item": "Vehicle Fire",
+                "fee_category": "Structure Fires",
+                "fee_label_from_document": "Vehicle fire",
+            }
+        ]
+
+    def test_non_list_input_returns_empty(self):
+        assert compact_fee_catalog(None) == []
+        assert compact_fee_catalog("fees") == []
+
+
+class TestIdentifyFeeResult:
+    CATALOG = [
+        {
+            "item": "Vehicle Fire",
+            "fee_category": "Structure Fires",
+            "fee_label_from_document": "Vehicle fire response",
+        },
+        {
+            "item": "Level 1",
+            "fee_category": "Structure Fires",
+            "fee_label_from_document": "",
+        },
+        {
+            "item": "Level 1",
+            "fee_category": "Rescue",
+            "fee_label_from_document": "",
+        },
+    ]
+
+    def test_category_only_matches_without_item(self):
+        """A category-only result is a valid selection — not 'Not
+        identified' — and resolves to the canonical category label."""
+        result = identify_fee_result(
+            {"billing_category": "structure fires"},
+            _dept(self.CATALOG),
+        )
+        assert result["match_status"] == "category_matched"
+        assert result["label"] == "Structure Fires"
+
+    def test_non_numbered_fee_item_matches(self):
+        """billing_level can carry a fee item name, not a numbered level."""
+        result = identify_fee_result(
+            {
+                "billing_category": "Structure Fires",
+                "billing_level": "vehicle fire",
+            },
+            _dept(self.CATALOG),
+        )
+        assert result["match_status"] == "matched"
+        assert result["label"] == "Structure Fires / Vehicle Fire"
+
+    def test_item_from_other_department_does_not_cross_match(self):
+        result = identify_fee_result(
+            {
+                "billing_category": "Structure Fires",
+                "billing_level": "Other Dept Item",
+            },
+            _dept(self.CATALOG),
+        )
+        assert result["match_status"] == "unmatched"
+        assert result["label"] == "Structure Fires / Other Dept Item"
+
+    def test_same_item_in_two_categories_ambiguous_without_category(self):
+        result = identify_fee_result(
+            {"billing_level": "Level 1"}, _dept(self.CATALOG)
+        )
+        assert result["match_status"] == "ambiguous"
+        # ...but resolves once the category is known
+        resolved = identify_fee_result(
+            {"billing_category": "Rescue", "billing_level": "Level 1"},
+            _dept(self.CATALOG),
+        )
+        assert resolved["match_status"] == "matched"
+        assert resolved["label"] == "Rescue / Level 1"
+
+    def test_document_label_alias_matches_canonical_item(self):
+        """A source label that differs from the canonical item still
+        matches via fee_label_from_document."""
+        result = identify_fee_result(
+            {
+                "billing_category": "Structure Fires",
+                "billing_level": "Vehicle fire response",
+            },
+            _dept(self.CATALOG),
+        )
+        assert result["match_status"] == "matched"
+        assert result["label"] == "Structure Fires / Vehicle Fire"
+        # level_label_matched is the fallback item when billing_level is
+        # absent.
+        assert identify_fee_result(
+            {
+                "billing_category": "Structure Fires",
+                "level_label_matched": "Vehicle fire response",
+            },
+            _dept(self.CATALOG),
+        )["match_status"] == "matched"
+
+    def test_no_output_is_not_identified(self):
+        for record in ({}, {"billing_category": "   "}, {"billing_level": ""}):
+            result = identify_fee_result(record, _dept(self.CATALOG))
+            assert result["match_status"] == "not_identified"
+            assert result["label"] == "Not identified"
+
+    def test_no_levels_configured_source_status_is_meaningful(self):
+        """The source reports no levels; do not infer that fee items are absent."""
+        result = identify_fee_result(
+            {"intake_status": "NO_LEVELS_CONFIGURED"}, _dept(self.CATALOG)
+        )
+        assert result["label"] == "Not identified"
+        assert result["match_status"] == "not_identified"
+        assert "Intake: No levels configured" in result["description"]
+        assert "No fee items configured" not in result["description"]
+        # A valid category result survives the source status.
+        assert identify_fee_result(
+            {
+                "billing_category": "Structure Fires",
+                "intake_status": "NO_LEVELS_CONFIGURED",
+            },
+            _dept(self.CATALOG),
+        )["match_status"] == "category_matched"
+        assert identify_fee_result(
+            {
+                "billing_category": "Structure Fires",
+                "intake_status": "NO_LEVELS_CONFIGURED",
+            },
+            _dept(self.CATALOG),
+        )["label"] == "Structure Fires"
+
+    def test_unmatched_retains_raw_label(self):
+        result = identify_fee_result(
+            {"billing_category": "Motor Vehicle Accident"},
+            _dept(self.CATALOG),
+        )
+        assert result["match_status"] == "unmatched"
+        assert result["label"] == "Motor Vehicle Accident"
+
+    def test_missing_config_is_configuration_unavailable(self):
+        for cfg in (None, {}, {"fee_catalog_version": 0}):
+            result = identify_fee_result({"billing_level": "X"}, cfg)
+            assert result["match_status"] == "configuration_unavailable"
+            assert result["label"] == "X"
+
+    def test_null_catalog_is_configuration_ambiguous(self):
+        result = identify_fee_result(
+            {"billing_level": "X"}, _dept(None)
+        )
+        assert result["match_status"] == "configuration_ambiguous"
+
+    def test_intake_status_and_low_confidence_appended(self):
+        result = identify_fee_result(
+            {
+                "billing_category": "Structure Fires",
+                "intake_status": "CATEGORY_ONLY",
+                "level_identification_low_confidence": True,
+            },
+            _dept(self.CATALOG),
+            config_status="stale",
+        )
+        assert result["match_status"] == "category_matched"
+        assert "Intake: Category identified" in result["description"]
+        assert "Low confidence" in result["description"]
+        assert "out of date" in result["description"]
+
+
+class TestStep1SourceFieldsPreserved:
+    SOURCE = {
+        "billing_level": "Vehicle Fire",
+        "level_identification_confidence": 88,
+        "level_identification_low_confidence": False,
+        "level_identification_reasoning": "matched tile",
+        "intake_status": "IDENTIFIED",
+        "intake_evaluated_at": "2026-10-01T00:00:00",
+        "intake_evaluation_count": 2,
+        "level_label_matched": "Vehicle fire",
+    }
+
+    def test_direct_read_to_normalized(self):
+        sql_row = {"claim_id": 1, "ai_inv_process_status": 2, "dept_id": 1}
+        record = build_normalized_record(sql_row, dict(self.SOURCE))
+        for field, value in self.SOURCE.items():
+            assert record[field] == value
+
+    def test_projection_adapter_to_normalized(self):
+        """Projection → adapter → normalized preserves the same fields as
+        the direct read."""
+        from ai_analytics.projection_read_repository import (
+            projection_to_ai_record,
+        )
+
+        adapted = projection_to_ai_record(
+            dict(self.SOURCE, projection_schema_version=4)
+        )
+        sql_row = {"claim_id": 1, "ai_inv_process_status": 2, "dept_id": 1}
+        via_projection = build_normalized_record(sql_row, adapted)
+        via_direct = build_normalized_record(sql_row, dict(self.SOURCE))
+        for field in self.SOURCE:
+            assert via_projection[field] == self.SOURCE[field]
+            assert via_projection[field] == via_direct[field]
+
+    def test_step1_source_fields_handles_none(self):
+        fields = step1_source_fields(None)
+        assert set(fields) == set(self.SOURCE)
+        assert all(v is None for v in fields.values())

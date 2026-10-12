@@ -136,16 +136,23 @@ const FunnelView: React.FC<{ stages: AiPipelineStageStat[] }> = ({ stages }) => 
                 >
                   {stage.breakdown.map((b) => (
                     <div
-                      key={b.label}
+                      key={JSON.stringify([b.label, b.match_status, b.description])}
                       style={{
                         display: 'flex',
                         justifyContent: 'space-between',
                         alignItems: 'center',
                       }}
                     >
-                      <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>
-                        {b.label}
-                      </span>
+                      <div style={{ display: 'flex', flexDirection: 'column' }}>
+                        <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>
+                          {b.label}
+                        </span>
+                        {b.description && (
+                          <span style={{ fontSize: '10px', color: 'var(--text-muted)', opacity: 0.8 }}>
+                            {b.description}
+                          </span>
+                        )}
+                      </div>
                       <span
                         style={{
                           fontSize: '11px',

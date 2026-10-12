@@ -47,6 +47,8 @@ export interface AiOutcomeSummary {
 export interface AiPipelineStageBreakdown {
   label: string;
   count: number;
+  match_status?: string | null;
+  description?: string;
 }
 
 export interface AiPipelineStageStat {

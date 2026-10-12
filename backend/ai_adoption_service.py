@@ -5,13 +5,16 @@ joins them with AI configuration status to produce an adoption summary:
 how many departments use AI, how many drafts flow through AI, and what
 the coverage gap is. Results are returned as ``AiAdoptionResponse``.
 """
+import json
 import logging
+from collections import defaultdict
 from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel
 
 from models import DashboardFilters
 from target_db import target_db
+from ai_analytics.fee_schedule import FEE_CATALOG_VERSION, compact_fee_catalog
 from ai_analytics.normalization_core import AI_SEND_OPTIONS, classify_fees
 
 logger = logging.getLogger(__name__)
@@ -70,23 +73,31 @@ async def get_ai_participation_map(
 
     Returns ``None`` when the AI Mongo source cannot be reached so that
     failures are not misclassified as ``not_using_ai``.
-    """
-    query: Dict[str, Any] = {
-        "fees_resources_final": {
-            "$elemMatch": {
-                "use_in_ai_process": True,
-                "fee_send_option": {"$in": list(AI_SEND_OPTIONS)},
-            }
-        }
-    }
-    if department_ids is not None:
-        query["department_id"] = {"$in": [int(d) for d in department_ids if d is not None]}
 
+    Reads every document with a finalized ``fees_resources_final`` array —
+    not only departments with a qualifying tile — so the result also carries
+    each department's compact fee catalog (``fee_catalog``) for step-1
+    result matching. Departments that legitimately have no qualifying tile
+    appear with ``uses_ai=False``; departments whose finalized schedules
+    conflict (multiple differing documents) get ``uses_ai=None`` /
+    ``ai_mode='unknown'`` / ``fee_catalog=None`` rather than an arbitrary
+    pick. Metadata-only documents (no ``fees_resources_final`` array) are
+    excluded by the ``$type`` filter and can never overwrite a finalized
+    schedule.
+    """
+    query: Dict[str, Any] = {"fees_resources_final": {"$type": "array"}}
+    if department_ids is not None:
+        ids = [int(d) for d in department_ids if d is not None]
+        query["department_id"] = {"$in": ids + [str(d) for d in ids]}
     projection = {
         "_id": 0,
         "department_id": 1,
         "department_name": 1,
-        "fees_resources_final": 1,
+        "fees_resources_final.item": 1,
+        "fees_resources_final.fee_category": 1,
+        "fees_resources_final.fee_label_from_document": 1,
+        "fees_resources_final.use_in_ai_process": 1,
+        "fees_resources_final.fee_send_option": 1,
     }
 
     try:
@@ -104,7 +115,10 @@ async def get_ai_participation_map(
         logger.error(f"Failed to read AI participation from MongoDB: {e}")
         return None
 
-    result: Dict[int, Dict[str, Any]] = {}
+    # Group finalized documents by department. Duplicate department IDs
+    # exist in the source; whether the duplicates agree decides whether an
+    # authoritative catalog can be selected at all.
+    docs_by_dept: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
     for row in rows:
         raw_id = row.get("department_id")
         if raw_id is None:
@@ -113,8 +127,50 @@ async def get_ai_participation_map(
             dept_id = int(raw_id)
         except (ValueError, TypeError):
             continue
-        info = _classify_fees(row.get("fees_resources_final", []))
-        info["department_name"] = row.get("department_name")
+        docs_by_dept[dept_id].append(row)
+
+    result: Dict[int, Dict[str, Any]] = {}
+    for dept_id, docs in docs_by_dept.items():
+        # A stable signature over ALL projected tile fields — including the
+        # enablement flags, so conflicting controls are not hidden — decides
+        # whether the finalized documents are equivalent.
+        signatures = {
+            json.dumps(
+                sorted(
+                    json.dumps(tile, sort_keys=True, default=str)
+                    for tile in (doc.get("fees_resources_final") or [])
+                )
+            )
+            for doc in docs
+        }
+        department_name = next(
+            (d.get("department_name") for d in docs if d.get("department_name")),
+            None,
+        )
+        if len(signatures) <= 1:
+            # Single document, or identical duplicates — equivalent, take the
+            # first; there is nothing to guess between.
+            fees = docs[0].get("fees_resources_final") or []
+            info = _classify_fees(fees)
+            info["fee_catalog_version"] = FEE_CATALOG_VERSION
+            info["fee_catalog"] = compact_fee_catalog(fees)
+        else:
+            # Differing finalized schedules — no authoritative pick. Report
+            # unknown rather than guessing via recency or merging catalogs.
+            logger.warning(
+                "Department %s has %d differing finalized fee schedule "
+                "documents; AI participation is ambiguous.",
+                dept_id,
+                len(docs),
+            )
+            info = _classify_fees([])
+            info.update(
+                uses_ai=None,
+                ai_mode="unknown",
+                fee_catalog=None,
+                fee_catalog_version=FEE_CATALOG_VERSION,
+            )
+        info["department_name"] = department_name
         result[dept_id] = info
     return result
 
@@ -214,7 +270,10 @@ async def get_ai_adoption_report(
                     "has_limited_auto": False,
                 },
             )
-            status = "using_ai" if ai_info["uses_ai"] else "not_using_ai"
+            if ai_info.get("uses_ai") is None:
+                status = "unknown"
+            else:
+                status = "using_ai" if ai_info["uses_ai"] else "not_using_ai"
 
         drafts = int(row.get("submitted_drafts", 0) or 0)
         pct = (drafts / total_drafts * 100) if total_drafts > 0 else 0.0

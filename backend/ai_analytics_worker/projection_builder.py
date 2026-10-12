@@ -39,6 +39,7 @@ import logging
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
+from ai_analytics.fee_schedule import step1_source_fields
 from ai_analytics.normalization_core import (
     calculate_retry_count,
     classify_billability,
@@ -292,20 +293,11 @@ def build_projection(
         "is_billable_not_determined": is_billable_not_determined,
         "billability_state": billability,
         "billing_category": billing_category,
-        # Step-1 level identification output (present on source docs from
-        # ~2026-09). Schema v3: passthrough so the outcomes funnel can break
-        # down identified levels.
-        "billing_level": (
-            ai_line_items.get("billing_level") if has_ai_record else None
-        ),
-        "level_identification_confidence": (
-            ai_line_items.get("level_identification_confidence")
-            if has_ai_record else None
-        ),
-        "level_identification_low_confidence": (
-            ai_line_items.get("level_identification_low_confidence")
-            if has_ai_record else None
-        ),
+        # Step-1 category/fee-item identification output + intake evidence
+        # (present on source docs from ~2026-09+). Schema v4: passthrough of
+        # fee_schedule.STEP1_SOURCE_FIELDS so the outcomes funnel can match
+        # results against the department fee catalog on either read path.
+        **step1_source_fields(ai_line_items if has_ai_record else None),
         # AI routing mode (mirrors Departments.IsSendInvoiceAI) and
         # AI-side cancellation fields on newer source docs.
         "dept_send_auto_invoice_status": (

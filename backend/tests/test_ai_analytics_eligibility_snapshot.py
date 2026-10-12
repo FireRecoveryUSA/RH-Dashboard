@@ -14,12 +14,15 @@ from ai_analytics_worker.config import worker_config
 PART = {1: {"uses_ai": True, "ai_mode": "auto"}}
 
 
-async def _seed(db, age_seconds=0):
-    await db[worker_config.AI_ELIGIBILITY_SNAPSHOT_COLLECTION].insert_one({
+async def _seed(db, age_seconds=0, schema_version=snap.SNAPSHOT_SCHEMA_VERSION):
+    doc = {
         "_id": worker_config.AI_ELIGIBILITY_SNAPSHOT_ID,
         "participation": {"1": PART[1]},
         "refreshed_at": datetime.now(UTC) - timedelta(seconds=age_seconds),
-    })
+    }
+    if schema_version is not None:
+        doc["schema_version"] = schema_version
+    await db[worker_config.AI_ELIGIBILITY_SNAPSHOT_COLLECTION].insert_one(doc)
 
 
 @pytest.mark.asyncio
@@ -80,6 +83,38 @@ async def test_no_snapshot_and_no_source_is_unavailable(mock_mongo_db):
     )
     assert result is None
     assert status == snap.STATUS_UNAVAILABLE
+
+
+@pytest.mark.asyncio
+async def test_fresh_legacy_snapshot_is_refreshed_immediately(mock_mongo_db):
+    """A snapshot written before schema_version existed (v1, boolean-only
+    participation) must not be served as fresh even when its TTL has not
+    elapsed — it lacks the fee catalogs needed for step-1 matching."""
+    await _seed(mock_mongo_db, schema_version=None)
+    fetch = AsyncMock(return_value={2: {"uses_ai": True}})
+    result, status = await snap.resolve_participation(
+        object(), mock_mongo_db, fetch=fetch, prefer_snapshot=True
+    )
+    assert result == {2: {"uses_ai": True}}
+    assert status == snap.STATUS_AVAILABLE
+    fetch.assert_awaited_once()
+    stored, _ = await snap.read_snapshot(mock_mongo_db)
+    assert stored == {2: {"uses_ai": True}}
+
+
+@pytest.mark.asyncio
+async def test_legacy_snapshot_serves_as_stale_fallback_on_source_failure(
+    mock_mongo_db,
+):
+    """If the source refresh of a legacy snapshot fails, its participation
+    map is still served (stale) rather than reporting unavailable."""
+    await _seed(mock_mongo_db, schema_version=None)
+    fetch = AsyncMock(return_value=None)
+    result, status = await snap.resolve_participation(
+        object(), mock_mongo_db, fetch=fetch, prefer_snapshot=True
+    )
+    assert result == PART
+    assert status == snap.STATUS_STALE
 
 
 @pytest.mark.asyncio

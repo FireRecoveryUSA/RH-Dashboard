@@ -121,6 +121,10 @@ class AiDepartmentOutcomeStat(BaseModel):
 class AiPipelineStageBreakdown(BaseModel):
     label: str
     count: int
+    # Step-1 result rows carry a catalog match_status and a description;
+    # other stages leave them unset.
+    match_status: Optional[str] = None
+    description: str = ""
 
 
 class AiPipelineStageStat(BaseModel):

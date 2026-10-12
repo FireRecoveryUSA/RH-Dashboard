@@ -46,7 +46,25 @@ const SUMMARY = {
 
 const FUNNEL = [
   { stage: 'AI Processing', count: 100, description: 'All invoices' },
-  { stage: 'AI Completed', count: 90, description: 'AI finished processing' },
+  {
+    stage: 'Step 1: category & fee item results',
+    count: 90,
+    description: 'AI records grouped by category and fee item.',
+    breakdown: [
+      {
+        label: 'Structure Fires',
+        count: 40,
+        match_status: 'category_matched',
+        description: 'Category matches current fee schedule · Intake: Category identified',
+      },
+      {
+        label: 'Structure Fires / Vehicle Fire',
+        count: 50,
+        match_status: 'matched',
+        description: 'Category and fee item match current fee schedule',
+      },
+    ],
+  },
   { stage: 'Business Reviewed', count: 80, description: 'Human reviewed' },
   { stage: 'Released', count: 60, description: 'Invoice released' },
 ];
@@ -145,6 +163,18 @@ describe('AiOutcomesDashboard', () => {
     // "AI Completed" and "Released" also appear as KPI labels — verify they exist
     expect(screen.getAllByText('AI Completed').length).toBeGreaterThanOrEqual(1);
     expect(screen.getAllByText('Released').length).toBeGreaterThanOrEqual(1);
+  });
+
+  test('renders step-1 breakdown with category labels and descriptions', async () => {
+    render(<AiOutcomesDashboard />);
+    await waitFor(() => expect(screen.getByText('AI Invoice Pipeline Funnel')).toBeInTheDocument());
+    // Actual fee-schedule category/item labels, not the old generic bucket.
+    expect(screen.getByText('Structure Fires')).toBeInTheDocument();
+    expect(screen.getByText('Structure Fires / Vehicle Fire')).toBeInTheDocument();
+    expect(
+      screen.getByText('Category matches current fee schedule · Intake: Category identified')
+    ).toBeInTheDocument();
+    expect(screen.queryByText('Category identified (no level)')).not.toBeInTheDocument();
   });
 
   test('renders rejection reasons with normalized categories', async () => {
