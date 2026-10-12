@@ -162,26 +162,37 @@ def identify_fee_result(
         return result(
             raw_label, 'unmatched', 'Not matched to current fee schedule'
         )
+    # Collect matches across both the canonical item name and the
+    # document-label alias in one pass — a label that names one tile's
+    # item and another tile's alias is genuinely ambiguous, and falling
+    # back to the alias scan only when the item scan misses would hide
+    # that.
     matches = [
-        t for t in category_tiles if _key(t.get('item')) == _key(item)
+        t
+        for t in category_tiles
+        if _key(t.get('item')) == _key(item)
+        or _key(t.get('fee_label_from_document')) == _key(item)
     ]
-    if not matches:
-        matches = [
-            t
-            for t in category_tiles
-            if _key(t.get('fee_label_from_document')) == _key(item)
-        ]
-    selections = {
-        (_text(t.get('fee_category')), _text(t.get('item'))) for t in matches
+    # Distinct fee selections are counted on normalized keys so tiles
+    # that differ only by case/whitespace collapse into one selection
+    # instead of reading as ambiguous.
+    selection_keys = {
+        (_key(t.get('fee_category')), _key(t.get('item'))) for t in matches
     }
-    if len(selections) == 1:
-        cat, fee = next(iter(selections))
+    if len(selection_keys) == 1:
+        key = next(iter(selection_keys))
+        # Deterministic display label among equivalent spellings.
+        cat, fee = min(
+            (_text(t.get('fee_category')), _text(t.get('item')))
+            for t in matches
+            if (_key(t.get('fee_category')), _key(t.get('item'))) == key
+        )
         return result(
             label(cat, fee),
             'matched',
             'Category and fee item match current fee schedule',
         )
-    if len(selections) > 1:
+    if len(selection_keys) > 1:
         return result(
             raw_label,
             'ambiguous',
