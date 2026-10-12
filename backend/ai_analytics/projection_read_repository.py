@@ -157,6 +157,67 @@ def projection_to_ai_record(
     return adapted
 
 
+async def get_projection_cohort(
+    db: Any,
+    start_utc: Any,
+    end_utc: Any,
+    department_id: Optional[int] = None,
+    date_field: str = "ai_inserted_at",
+) -> List[Dict[str, Any]]:
+    """Fetch the AI cohort directly from the projection collection.
+
+    This is the Mongo-first cohort source for the outcomes dashboard: every
+    projection doc is a run that was submitted to us and entered the AI
+    process (the AI record is created at submission time), so the cohort no
+    longer depends on the SQL ``AIInvoiceProcessRHTemp`` table — which only
+    receives a row when the AI *completes* a claim, hiding everything
+    in-flight.
+
+    Arguments:
+        db: the dashboard-owned Motor database handle (``db_manager.db``).
+        start_utc: inclusive UTC datetime lower bound for the date window.
+        end_utc: exclusive UTC datetime upper bound for the date window.
+        department_id: optional department filter (projection field
+            ``department_id``).
+        date_field: projection datetime field to filter on —
+            ``ai_inserted_at`` (submitted to us) or ``ai_updated_at``.
+
+    Returns:
+        List of raw projection documents (unadapted — callers decide which
+        shape they need: ``projection_to_ai_record`` for normalization).
+    """
+    collection = db[worker_config.PROJECTIONS_COLLECTION]
+
+    query: Dict[str, Any] = {
+        # Claims whose only AI trace is a conversation (no ai_line_items
+        # doc) are not AI-processed runs — exclude them from the cohort.
+        "has_ai_line_item_record": {"$ne": False},
+    }
+    # Date bounds are optional — an unbounded query must not filter on
+    # None (Mongo comparisons against None match nothing).
+    if start_utc is not None or end_utc is not None:
+        date_filter: Dict[str, Any] = {}
+        if start_utc is not None:
+            date_filter["$gte"] = start_utc
+        if end_utc is not None:
+            date_filter["$lt"] = end_utc
+        query[date_field] = date_filter
+    if department_id is not None:
+        query["department_id"] = department_id
+
+    try:
+        cursor = collection.find(query)
+        docs = await cursor.to_list(length=None)
+    except Exception as e:
+        logger.error("Projection cohort query failed: %s", e)
+        raise
+    logger.info(
+        "Projection cohort: %d docs for %s in [%s, %s).",
+        len(docs), date_field, start_utc, end_utc,
+    )
+    return docs
+
+
 async def get_projection_records_for_claim_ids(
     db: Any,
     claim_ids: List[int],

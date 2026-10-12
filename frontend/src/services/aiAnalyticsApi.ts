@@ -47,6 +47,8 @@ export interface AiOutcomeSummary {
 export interface AiPipelineStageBreakdown {
   label: string;
   count: number;
+  /** Optional dollar total for the row (e.g. invoice value per fee card). */
+  value?: number | null;
   match_status?: string | null;
   description?: string;
 }

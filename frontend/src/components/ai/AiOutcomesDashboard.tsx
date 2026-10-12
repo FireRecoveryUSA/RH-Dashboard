@@ -161,6 +161,11 @@ const FunnelView: React.FC<{ stages: AiPipelineStageStat[] }> = ({ stages }) => 
                         }}
                       >
                         {b.count.toLocaleString()}
+                        {b.value != null && (
+                          <span style={{ fontWeight: 400, marginLeft: '6px' }}>
+                            · ${b.value.toLocaleString(undefined, { maximumFractionDigits: 0 })}
+                          </span>
+                        )}
                       </span>
                     </div>
                   ))}

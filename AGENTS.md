@@ -84,6 +84,7 @@ all implemented and passing. What remains is **Azure-side configuration only**
 ### Goal when resumed
 
 The objective is to analyze:
+
 - What is actually costing us money
 - What costs are going up
 - Why they are going up
@@ -127,6 +128,7 @@ use `useAiDateRange`. Do not copy the `useEffect` + `api.getServerDate()` +
 
 Local Docker Desktop development. `dev-start.ps1` is a thin wrapper over
 `docker compose` — it is the only script; there is no separate logs script:
+
 ```powershell
 .\dev-start.ps1              # Build + run (default)
 .\dev-start.ps1 -NoCache     # Full clean rebuild + restart
@@ -139,8 +141,9 @@ Local Docker Desktop development. `dev-start.ps1` is a thin wrapper over
 ```
 
 Stack runs at:
-- Frontend: http://localhost:3000
-- Backend:  http://localhost:8001/docs
+
+- Frontend: <http://localhost:3000>
+- Backend:  <http://localhost:8001/docs>
 - MongoDB:  localhost:27017
 
 ### The stack is Compose-managed
@@ -274,6 +277,48 @@ claim buckets:
 column (`_resolve_claims_date_column()`) by preferring the temporal
 `AS_ROW_START` column and falling back to `DateCreated` or similar.
 
+## AI Outcomes Dashboard — Mongo-First Cohort (2026-10-11)
+
+The AI Outcomes dashboard cohort is **the projection, not SQL**. The AI
+record (`ai_line_items`) is created at the moment a run is submitted to us
+(`ai_inserted_at` == `Claims.date_of_submitted` expressed in UTC; org-local
+civil dates are UTC-7, configured via `AI_LOCAL_UTC_OFFSET_HOURS`), so
+`_load_normalized_cohort` in `backend/ai_analytics/outcome_service.py`
+queries `ai_invoice_analytics` (via
+`projection_read_repository.get_projection_cohort`) for the date window and
+normalizes each projection doc through the shared
+`build_normalized_record` with a synthetic SQL-row shape.
+
+Recovery Hub SQL is joined **only** for claims that reached the review grid
+(`line_items_save_to_rh_status` true) — process logs (released/cancelled)
+and cancellation details — because that is the point where the business
+process hands over to Recovery Hub. The old design gated the whole cohort
+on `AIInvoiceProcessRHTemp`, which only receives a row when the AI
+*completes* a claim, hiding every in-flight run (the "12 runs invisible in
+the current week" bug). Pre-grid claims with no terminal evidence are
+classified `pending`, never `unknown`.
+
+Date bases: `business_status_date` / `claim_created_date` /
+`ai_record_inserted_date` all resolve to `ai_inserted_at` (submitted to
+us); `ai_record_updated_date` resolves to `ai_updated_at`. Local date
+windows are converted to UTC windows using the org offset — do not filter
+the projection on raw UTC midnights.
+
+The funnel is **six period-scoped sections** (operator-specified
+2026-10-11), reconciled with the Claims Breakdown buckets via
+`sql_repo.get_claim_lifecycle_for_claims` (batched `ClaimCurrentTypeId` /
+`status` / `archived` PK lookup): 1. Step 1 fee card & value plugged in
+(breakdown per billing level, else category — NO "category no level"
+bucket; each row carries `value` = summed invoice_total) → 2. AI runs
+submitted this period (still in New Runs vs moved on) → 3. Left New Runs
+— claim status at handoff (grouped by RH claim status) → 4. HITL grid vs
+elsewhere (two rows) → 5. In the HITL grid now, pending review (by
+department; the invoice grid below lists them) → 6. Left the HITL grid —
+accepted/released (with RH status) or rejected (+ normalized
+rejection-reason breakdown). Stage counts are intentionally NOT
+monotonic — sections answer different questions about the same period
+cohort; each breakdown partitions its own stage.
+
 ## AI Analytics Worker — Phase 0
 
 The AI Analytics Worker is an event-driven projection service that reads
@@ -389,6 +434,7 @@ populated in production per the Phase 0 audit, so their absence is
 semantically identical to the direct-read path returning `None`.
 
 **Phase 10 endpoint behavior:**
+
 - `/invoices/{claim_id}/trace` — reads AI summary fields from the projection
   when enabled, including canonicalized line items with nested `resources`,
   `review_msg`, timestamps, and retry fields. Full conversation payloads are
@@ -416,6 +462,7 @@ endpoints to read from the projection when `AI_ANALYTICS_USE_PROJECTION`
 is true:
 
 **Schema v2 additions (projection_schema_version 1 → 2):**
+
 - `ai_line_items` — now includes `resources` in each entry (was summary-only)
 - `conversation_summaries` — new list of per-conversation summary dicts
   (conversation_id, agent, status, created_at as ISO string, processing_stage,
@@ -429,6 +476,7 @@ shape and are upgraded lazily on next refresh. The read adapter returns
 `None`/empty for v1-missing fields — callers fall back gracefully.
 
 **`/invoices/{claim_id}/trace` (Phase 10 migration):**
+
 - When flag is on: reads AI summary from the projection (line items with
   resources, review_msg, timestamps, processing status, etc.) via
   `projection_read_repository.get_projection_for_trace`. Eliminates the
@@ -443,6 +491,7 @@ shape and are upgraded lazily on next refresh. The read adapter returns
   automatically.
 
 **`/diagnostics/agents` (Phase 10 migration):**
+
 - When flag is on: aggregates from the projection's
   `conversation_summaries` via `$unwind` + `$group` on the
   `ai_invoice_analytics` collection. Eliminates the batch cross-cluster
@@ -453,6 +502,7 @@ shape and are upgraded lazily on next refresh. The read adapter returns
   incorrect.
 
 **Projection schema version bump:**
+
 - `AI_ANALYTICS_WORKER_PROJECTION_SCHEMA_VERSION` default changed from
   1 to 2 in `config.py`. Existing deployments that pin the env var to 1
   continue producing v1 projections (no breaking change). New/restarted
@@ -473,6 +523,7 @@ and auto-heal on divergence.
 Divergent claims are auto-enqueued into the ClaimQueue for refresh.
 
 **Why sync integrity is separate from reconciliation:**
+
 - Reconciliation (Phase 7) catches *missed change events* — looks for
   `updated_at > checkpoint`. Does NOT verify existing projections.
 - Sync integrity (Phase 11) catches *divergence* — verifies existing
@@ -485,6 +536,7 @@ Divergent claims are auto-enqueued into the ClaimQueue for refresh.
   `stopped`
 
 **New endpoints:**
+
 - `GET /api/ai-analytics/worker/sync-health` — sync health summary
   (auth-protected, consumed by SyncHealthIndicator)
 - `GET /api/ai-analytics/worker/dead-letters` — unresolved dead-lettered
@@ -499,10 +551,12 @@ metrics, errors, and dead-letter list with resolve buttons. Auto-refreshes
 every 30s.
 
 **New config settings:**
+
 - `WORKER_SYNC_INTEGRITY_INTERVAL_MINUTES` (default 5)
 - `WORKER_SYNC_INTEGRITY_SAMPLE_SIZE` (default 50)
 
 **New metrics counters:**
+
 - `sync_integrity_checks` — incremented on each check cycle
 - `sync_integrity_divergent_found` — incremented by divergent claim count
 
@@ -544,7 +598,7 @@ top to bottom (`test_funnel_cancelled_outcome` asserts monotonicity):
    the saved cohort by grid outcome — "Released" / "Cancelled / Rejected"
    (cancellation detail row, cancelled log, or `ai_line_items.is_cancelled`)
    / "In review grid (pending)" — so the three sum to the stage count, plus
-   "Cancelled — <reason>" rows per normalized rejection category (via
+   "Cancelled — \<reason\>" rows per normalized rejection category (via
    `reason_normalization.CATEGORY_LABELS`).
 6. **Released** — process log "Invoice to Insurance - Released" or status 7.
 

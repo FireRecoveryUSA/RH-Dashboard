@@ -170,7 +170,7 @@ _Q_SORT_BY = Query("ai_business_updated_at", description="Sort column")
 _Q_SORT_DIRECTION = Query("desc", description="Sort direction: asc | desc")
 _Q_DATE_BASIS = Query(
     "business_status_date",
-    description="Date basis: business_status_date | claim_created_date | ai_record_updated_date",
+    description="Date basis: business_status_date | claim_created_date | ai_record_inserted_date | ai_record_updated_date (all resolve to the AI record's submitted-to-us timestamp except the last, which uses the AI record's last update)",
 )
 
 
