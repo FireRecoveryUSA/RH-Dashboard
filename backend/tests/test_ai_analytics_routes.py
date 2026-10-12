@@ -741,6 +741,102 @@ class TestAiEligibilityGating:
     @patch("ai_analytics.outcome_service.projection_repo.get_projection_cohort", new_callable=AsyncMock)
     @patch("ai_analytics.outcome_service.sql_repo.get_cancellation_details_for_claims")
     @patch("ai_analytics.outcome_service.sql_repo.get_process_logs_for_claims")
+    def test_funnel_step1_matches_against_fee_catalog(
+        self, mock_logs, mock_canc, mock_mongo, mock_cohort, mock_part, test_client,
+    ):
+        """With a real fee catalog on the participation map, a
+        category-only result resolves to the canonical category label and
+        a fee-item value matches its tile."""
+        participation = _participation()
+        participation[1]["fee_catalog_version"] = 1
+        participation[1]["fee_catalog"] = [
+            {"item": "Vehicle Fire", "fee_category": "Structure Fires",
+             "fee_label_from_document": "Vehicle fire response"},
+            {"item": "", "fee_category": "Structure Fires",
+             "fee_label_from_document": ""},
+        ]
+        # Dept 2's catalog shares no categories/items with dept 1 — the
+        # same source output must not cross-match across departments.
+        participation[2] = {
+            "uses_ai": True, "ai_mode": "queued", "qualifying_fee_count": 1,
+            "has_auto": False, "has_queued": True, "has_limited_auto": False,
+            "fee_catalog_version": 1,
+            "fee_catalog": [
+                {"item": "Rescue Response", "fee_category": "Rescue",
+                 "fee_label_from_document": ""},
+            ],
+        }
+        mock_part.return_value = participation
+        cohort = [
+            {"claim_id": 100, "AI_inv_process_status": 2, "dept_id": 1,
+             "ai_business_updated_at": "2026-01-15T10:00:00"},
+            {"claim_id": 200, "AI_inv_process_status": 2, "dept_id": 1,
+             "ai_business_updated_at": "2026-01-15T10:00:00"},
+            {"claim_id": 300, "AI_inv_process_status": 2, "dept_id": 2,
+             "ai_business_updated_at": "2026-01-15T10:00:00"},
+        ]
+        mock_cohort.return_value = cohort
+        mock_mongo.return_value = {
+            # Category-only result — a valid category selection.
+            100: {"claim_processing_status": "COMPLETED",
+                  "billing_category": "Structure Fires",
+                  "intake_status": "CATEGORY_ONLY"},
+            # Item result, documented under its source-schedule label —
+            # resolves to the canonical fee item via the alias.
+            200: {"claim_processing_status": "COMPLETED",
+                  "billing_category": "Structure Fires",
+                  "billing_level": "Vehicle fire response",
+                  "intake_status": "IDENTIFIED"},
+            # Identical dept-1 labels under dept 2's catalog → unmatched.
+            300: {"claim_processing_status": "COMPLETED",
+                  "billing_category": "Structure Fires",
+                  "billing_level": "Vehicle Fire"},
+        }
+        mock_canc.return_value = {}
+        mock_logs.return_value = {}
+
+        response = test_client.get("/api/ai-analytics/outcomes/funnel", headers=AUTH)
+        assert response.status_code == 200
+        stages = response.json()
+        assert stages[2]["count"] == 3
+        breakdown = {
+            (b["label"], b["match_status"]): b
+            for b in stages[2]["breakdown"]
+        }
+        cat = breakdown[("Structure Fires", "category_matched")]
+        assert cat["count"] == 1
+        assert "Intake: Category identified" in cat["description"]
+        item = breakdown[("Structure Fires / Vehicle Fire", "matched")]
+        assert item["count"] == 1
+        # Dept 2's record keeps its raw label, explicitly unmatched.
+        other = breakdown[("Structure Fires / Vehicle Fire", "unmatched")]
+        assert other["count"] == 1
+        assert "Category identified (no level)" not in {
+            b["label"] for b in stages[2]["breakdown"]
+        }
+        assert sum(b["count"] for b in stages[2]["breakdown"]) == 3
+        counts = [s["count"] for s in stages]
+        assert counts == sorted(counts, reverse=True)
+
+        # A department filter is forwarded to the SQL cohort and scopes the
+        # breakdown to that department's catalog results.
+        mock_cohort.return_value = cohort[:2]
+        response = test_client.get(
+            "/api/ai-analytics/outcomes/funnel?department_id=1", headers=AUTH
+        )
+        assert response.status_code == 200
+        assert mock_cohort.call_args.kwargs["department_id"] == 1
+        stages = response.json()
+        assert stages[2]["count"] == 2
+        assert {b["match_status"] for b in stages[2]["breakdown"]} == {
+            "category_matched", "matched"
+        }
+
+    @patch("ai_analytics.outcome_service.get_ai_participation_map", new_callable=AsyncMock)
+    @patch("ai_analytics.outcome_service.sql_repo.get_ai_invoice_cohort")
+    @patch("ai_analytics.outcome_service.mongo_repo.get_ai_line_items_for_claim_ids", new_callable=AsyncMock)
+    @patch("ai_analytics.outcome_service.sql_repo.get_cancellation_details_for_claims")
+    @patch("ai_analytics.outcome_service.sql_repo.get_process_logs_for_claims")
     def test_participation_unavailable_marks_unknown_not_disqualified(
         self, mock_logs, mock_canc, mock_cohort, mock_part, mock_life, test_client,
     ):

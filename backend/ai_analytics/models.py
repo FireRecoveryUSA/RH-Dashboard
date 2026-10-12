@@ -124,6 +124,10 @@ class AiPipelineStageBreakdown(BaseModel):
     # Optional dollar total for the row (e.g. the invoice value plugged in
     # per fee card in the step-1 breakdown). None when not applicable.
     value: Optional[float] = None
+    # Step-1 result rows carry a catalog match_status and a description;
+    # other stages leave them unset.
+    match_status: Optional[str] = None
+    description: str = ""
 
 
 class AiPipelineStageStat(BaseModel):

@@ -1144,3 +1144,35 @@ class TestPhase10TraceFields:
 
         assert proj["conversation_id"] is None
         assert proj["thread_id_is_billable"] is None
+
+
+# ---------------------------------------------------------------------------
+# Step-1 identification + intake evidence (schema v4)
+# ---------------------------------------------------------------------------
+
+
+class TestStep1SourceFields:
+    """fee_schedule.STEP1_SOURCE_FIELDS pass through the projection so the
+    funnel can match results against the department fee catalog."""
+
+    SOURCE = {
+        "billing_level": "Vehicle Fire",
+        "level_identification_confidence": 88,
+        "level_identification_low_confidence": False,
+        "level_identification_reasoning": "matched tile",
+        "intake_status": "IDENTIFIED",
+        "intake_evaluated_at": "2026-10-01T00:00:00",
+        "intake_evaluation_count": 2,
+        "level_label_matched": "Vehicle fire",
+    }
+
+    def test_step1_fields_copied_from_source(self):
+        doc = make_ai_line_items(**self.SOURCE)
+        proj = build_projection(12345, doc, [], PROCESSED_AT)
+        for field, value in self.SOURCE.items():
+            assert proj[field] == value
+
+    def test_step1_fields_none_when_no_source(self):
+        proj = build_projection(12345, None, [], PROCESSED_AT)
+        for field in self.SOURCE:
+            assert proj[field] is None

@@ -13,6 +13,8 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+from .fee_schedule import STEP1_SOURCE_FIELDS
+
 logger = logging.getLogger(__name__)
 
 # Collection names — verified in Phase 0
@@ -55,10 +57,9 @@ SUMMARY_PROJECTION = {
     "processing_time_seconds": 1,
     "retry_count": 1,
     "completed_at": 1,
-    # Step-1 level identification fields (added to production ~2026-09)
-    "billing_level": 1,
-    "level_identification_confidence": 1,
-    "level_identification_low_confidence": 1,
+    # Step-1 category/fee-item identification + intake evidence fields
+    # (see ai_analytics.fee_schedule — single source of truth).
+    **{field: 1 for field in STEP1_SOURCE_FIELDS},
     # Cancellation fields populated on newer ai_line_items docs
     "is_cancelled": 1,
     "cancellation_reason": 1,

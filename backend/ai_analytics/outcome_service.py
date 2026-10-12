@@ -56,6 +56,7 @@ from .normalization_core import (
     ELIGIBILITY_NOT_CONFIGURED,
     ELIGIBILITY_UNKNOWN,
 )
+from .fee_schedule import identify_fee_result
 from .reason_normalization import normalize_reason, CATEGORY_LABELS
 from .eligibility_snapshot import (
     STATUS_STALE as ELIGIBILITY_STATUS_STALE,
@@ -353,15 +354,22 @@ async def _load_normalized_cohort(
     for record in normalized:
         dept_id = record.get("department_id")
         dept_uses_ai: Optional[bool] = None
-        if participation is not None:
-            info = participation.get(
-                int(dept_id) if dept_id is not None else None
-            )
-            dept_uses_ai = bool(info and info.get("uses_ai"))
+        info: Optional[Dict[str, Any]] = None
+        if participation is not None and dept_id is not None:
+            info = participation.get(int(dept_id))
+            # uses_ai=None means conflicting finalized schedules —
+            # preserve it as unknown rather than bool-coercing to
+            # not_configured. A missing department id stays unknown.
+            dept_uses_ai = info.get("uses_ai") if info else False
         record["ai_eligibility"] = classify_ai_eligibility(
             dept_uses_ai=dept_uses_ai,
             writeback_status=record.get("writeback_status"),
             business_outcome=record.get("business_outcome"),
+        )
+        # Step-1 result described against this department's current fee
+        # catalog (when the participation map carries one).
+        record["fee_identification"] = identify_fee_result(
+            record, info, fee_config_status
         )
     logger.info(
         f"AI analytics: Eligibility classification took "

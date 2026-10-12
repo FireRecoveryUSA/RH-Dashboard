@@ -96,17 +96,64 @@ def test_department_activity_matches_claims_submitted_tile_query():
     assert "TOP" not in query  # fetch ALL departments; slicing done in Python
 
 
-@pytest.mark.asyncio
-async def test_get_ai_participation_map_returns_qualifying_departments_only():
+class _AsyncCursor:
+    def __init__(self, items):
+        self._items = items
+
+    async def to_list(self, length=None):
+        return self._items
+
+
+class _AsyncCol:
+    def __init__(self, col):
+        self._col = col
+
+    def find(self, *args, **kwargs):
+        return _AsyncCursor(list(self._col.find(*args, **kwargs)))
+
+
+class _AsyncDb:
+    def __init__(self, db):
+        self._db = db
+
+    def __getitem__(self, name):
+        return _AsyncCol(self._db[name])
+
+    async def list_collection_names(self):
+        return self._db.list_collection_names()
+
+
+def _async_ai_db(docs):
     client = mongomock.MongoClient()
     db = client["test_ai"]
-    db["department_fees_resources"].insert_many([
+    db["department_fees_resources"].insert_many(docs)
+    return _AsyncDb(db)
+
+
+@pytest.mark.asyncio
+async def test_get_ai_participation_map_returns_all_finalized_departments():
+    """All departments with a finalized fees_resources_final array are
+    returned — including those without a qualifying tile — so the map can
+    carry each department's fee catalog for step-1 result matching."""
+    ai_db = _async_ai_db([
         {
             "department_id": 123,
             "department_name": "Test FD",
             "fees_resources_final": [
-                {"use_in_ai_process": True, "fee_send_option": "auto"},
-                {"use_in_ai_process": False, "fee_send_option": "disabled"},
+                {
+                    "item": "Vehicle Fire",
+                    "fee_category": "Structure Fires",
+                    "fee_label_from_document": "Vehicle fire",
+                    "use_in_ai_process": True,
+                    "fee_send_option": "auto",
+                },
+                {
+                    "item": "Rescue Response",
+                    "fee_category": "Rescue",
+                    "fee_label_from_document": "Rescue service",
+                    "use_in_ai_process": False,
+                    "fee_send_option": "disabled",
+                },
             ],
         },
         {
@@ -118,37 +165,126 @@ async def test_get_ai_participation_map_returns_qualifying_departments_only():
         },
     ])
 
-    class _AsyncCursor:
-        def __init__(self, items):
-            self._items = items
-
-        async def to_list(self, length=None):
-            return self._items
-
-    class _AsyncCol:
-        def __init__(self, col):
-            self._col = col
-
-        def find(self, *args, **kwargs):
-            return _AsyncCursor(list(self._col.find(*args, **kwargs)))
-
-    class _AsyncDb:
-        def __init__(self, db):
-            self._db = db
-
-        def __getitem__(self, name):
-            return _AsyncCol(self._db[name])
-
-        async def list_collection_names(self):
-            return self._db.list_collection_names()
-
-    ai_db = _AsyncDb(db)
     result = await get_ai_participation_map(ai_db)
 
     assert 123 in result
-    assert 456 not in result
+    assert 456 in result
     assert result[123]["uses_ai"] is True
     assert result[123]["ai_mode"] == "auto"
+    assert result[456]["uses_ai"] is False
+    # Disabled tiles still feed the catalog so historical results can
+    # match — eligibility (qualifying_fee_count) and the catalog are
+    # different views of the same tiles.
+    assert result[123]["qualifying_fee_count"] == 1
+    assert result[123]["fee_catalog"] == [
+        {
+            "item": "Vehicle Fire",
+            "fee_category": "Structure Fires",
+            "fee_label_from_document": "Vehicle fire",
+        },
+        {
+            "item": "Rescue Response",
+            "fee_category": "Rescue",
+            "fee_label_from_document": "Rescue service",
+        },
+    ]
+    assert result[123]["fee_catalog_version"] == 1
+
+
+@pytest.mark.asyncio
+async def test_get_ai_participation_map_ignores_metadata_only_duplicate():
+    """A metadata-only duplicate document (no fees_resources_final array)
+    must not overwrite or conflict with the department's finalized doc."""
+    ai_db = _async_ai_db([
+        {
+            "department_id": 2660,
+            "department_name": "Dup FD",
+            "fees_resources_final": [
+                {
+                    "item": "Vehicle Fire",
+                    "fee_category": "Structure Fires",
+                    "use_in_ai_process": True,
+                    "fee_send_option": "auto",
+                },
+            ],
+        },
+        # Metadata-only doc — no fees_resources_final array at all.
+        {"department_id": 2660, "department_name": "Dup FD meta"},
+    ])
+
+    result = await get_ai_participation_map(ai_db)
+
+    assert result[2660]["uses_ai"] is True
+    assert result[2660]["fee_catalog"] == [
+        {
+            "item": "Vehicle Fire",
+            "fee_category": "Structure Fires",
+            "fee_label_from_document": "",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_get_ai_participation_map_differing_finalized_docs_is_unknown():
+    """Two differing finalized schedules for one department must not be
+    guessed between — the entry reports unknown and no catalog."""
+    ai_db = _async_ai_db([
+        {
+            "department_id": 3158,
+            "department_name": "Conflict FD",
+            "fees_resources_final": [
+                {
+                    "item": "Vehicle Fire",
+                    "fee_category": "Structure Fires",
+                    "use_in_ai_process": True,
+                    "fee_send_option": "auto",
+                },
+            ],
+        },
+        {
+            "department_id": 3158,
+            "department_name": "Conflict FD",
+            "fees_resources_final": [
+                {
+                    "item": "Rescue Response",
+                    "fee_category": "Rescue",
+                    "use_in_ai_process": True,
+                    "fee_send_option": "queued",
+                },
+            ],
+        },
+    ])
+
+    result = await get_ai_participation_map(ai_db)
+
+    info = result[3158]
+    assert info["uses_ai"] is None
+    assert info["ai_mode"] == "unknown"
+    assert info["fee_catalog"] is None
+    assert info["fee_catalog_version"] == 1
+
+
+@pytest.mark.asyncio
+async def test_get_ai_participation_map_identical_duplicates_use_first():
+    """Identical finalized duplicates are equivalent — the first is used."""
+    doc = {
+        "department_id": 42,
+        "department_name": "Same FD",
+        "fees_resources_final": [
+            {
+                "item": "Vehicle Fire",
+                "fee_category": "Structure Fires",
+                "use_in_ai_process": True,
+                "fee_send_option": "auto",
+            },
+        ],
+    }
+    ai_db = _async_ai_db([doc, dict(doc)])
+
+    result = await get_ai_participation_map(ai_db)
+
+    assert result[42]["uses_ai"] is True
+    assert result[42]["fee_catalog"] is not None
 
 
 def _mock_activity():

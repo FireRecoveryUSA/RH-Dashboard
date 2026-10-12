@@ -27,6 +27,7 @@ import logging
 from collections import defaultdict
 from typing import Any, Dict, List, Optional, Sequence
 
+from .fee_schedule import step1_source_fields
 from .reason_normalization import normalize_reason
 
 logger = logging.getLogger(__name__)
@@ -639,14 +640,9 @@ def build_normalized_record(
         "agent_execution_status": agent_exec_status,
         "is_billable": ai_record.get("is_billable") if ai_record else None,
         "billing_category": ai_record.get("billing_category") if ai_record else None,
-        # Step-1 level identification output (present on docs from ~2026-09)
-        "billing_level": ai_record.get("billing_level") if ai_record else None,
-        "level_identification_confidence": (
-            ai_record.get("level_identification_confidence") if ai_record else None
-        ),
-        "level_identification_low_confidence": (
-            ai_record.get("level_identification_low_confidence") if ai_record else None
-        ),
+        # Step-1 category/fee-item identification output + intake evidence
+        # (fee_schedule.STEP1_SOURCE_FIELDS; present on docs from ~2026-09+)
+        **step1_source_fields(ai_record),
         # Snapshot of the department's IsSendInvoiceAI flag at processing
         # time (2 = AI invoicing enabled → line items go to the review
         # grid; 0 = evaluated only, never writes line items back). It is

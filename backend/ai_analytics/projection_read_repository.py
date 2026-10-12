@@ -50,9 +50,10 @@ Architectural constraints:
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 from ai_analytics_worker.config import worker_config
+from .fee_schedule import STEP1_SOURCE_FIELDS
 
 logger = logging.getLogger(__name__)
 
@@ -95,12 +96,12 @@ _PASSTHROUGH_FIELDS: tuple[str, ...] = (
     "billing_category",
     "line_items_save_to_rh_status",
     "retry_count",
-    # Schema v3: step-1 level identification + routing/cancellation fields.
-    # v1/v2 projections lack these keys — .get() returns None, matching the
-    # direct-read path when the source doc doesn't have them.
-    "billing_level",
-    "level_identification_confidence",
-    "level_identification_low_confidence",
+    # Schema v3: routing/cancellation fields. Schema v4: step-1
+    # category/fee-item identification + intake evidence
+    # (fee_schedule.STEP1_SOURCE_FIELDS). Older projections lack these
+    # keys — .get() returns None, matching the direct-read path when the
+    # source doc doesn't have them.
+    *STEP1_SOURCE_FIELDS,
     "dept_send_auto_invoice_status",
     "is_cancelled",
     "cancellation_reason",
@@ -145,6 +146,13 @@ def projection_to_ai_record(
     # Fields not in the projection — explicit None for completeness.
     for field in _MISSING_FROM_PROJECTION:
         adapted[field] = None
+
+    # Internal (not part of the raw ai_line_items shape): the projection's
+    # own schema version, so the cohort loader can detect outdated
+    # projections and refresh them from the source. Missing → 0.
+    adapted["_projection_schema_version"] = projection.get(
+        "projection_schema_version", 0
+    )
 
     return adapted
 
@@ -213,6 +221,7 @@ async def get_projection_cohort(
 async def get_projection_records_for_claim_ids(
     db: Any,
     claim_ids: List[int],
+    absent_claim_ids: Optional[Set[int]] = None,
 ) -> Dict[int, Dict[str, Any]]:
     """Fetch projection documents for a batch of claim IDs.
 
@@ -229,6 +238,14 @@ async def get_projection_records_for_claim_ids(
         db: the dashboard-owned Motor database handle (``db_manager.db``,
             NOT ``db_manager.ai_db``).
         claim_ids: the claim IDs to fetch projections for.
+        absent_claim_ids: optional caller-provided set that is populated
+            with the claim IDs whose *current-schema* projection
+            explicitly records ``has_ai_line_item_record=false``. Lets
+            callers distinguish "no projection / stale projection"
+            (refresh from source) from "authoritative negative
+            projection" (keep ``missing``; the source read would return
+            nothing anyway). Stale negative projections are not added —
+            they still warrant a source refresh.
 
     Returns:
         Dict mapping ``claim_id`` (int) → adapted ai_record dict.
@@ -256,6 +273,15 @@ async def get_projection_records_for_claim_ids(
         if claim_id is None:
             continue
         if not doc.get("has_ai_line_item_record", True):
+            if (
+                absent_claim_ids is not None
+                and doc.get("projection_schema_version", 0)
+                >= worker_config.projection_schema_version
+            ):
+                try:
+                    absent_claim_ids.add(int(claim_id))
+                except (ValueError, TypeError):
+                    pass
             continue
         try:
             cid = int(claim_id)
@@ -302,10 +328,9 @@ _TRACE_PASSTHROUGH_FIELDS: tuple[str, ...] = (
     # Phase 10 new fields (v2 projections only; v1 returns None)
     "conversation_id",
     "thread_id_is_billable",
-    # Schema v3: step-1 level identification fields
-    "billing_level",
-    "level_identification_confidence",
-    "level_identification_low_confidence",
+    # Schema v3/v4: step-1 identification + intake evidence fields
+    # (fee_schedule.STEP1_SOURCE_FIELDS).
+    *STEP1_SOURCE_FIELDS,
 )
 
 # The projection stores line items under ``ai_line_items``; the trace

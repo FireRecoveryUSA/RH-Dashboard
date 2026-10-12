@@ -26,6 +26,14 @@ STATUS_AVAILABLE = "available"
 STATUS_STALE = "stale"
 STATUS_UNAVAILABLE = "unavailable"
 
+# Snapshot document schema. v1 stored a boolean-only participation map
+# (no fee catalogs); v2 entries may also carry ``fee_catalog`` /
+# ``fee_catalog_version`` for step-1 result matching. A stored doc whose
+# ``schema_version`` is not current is reported as never-refreshed so a
+# fresh legacy snapshot is still refreshed immediately — it remains
+# servable as the stale fallback if the source read fails.
+SNAPSHOT_SCHEMA_VERSION = 2
+
 
 async def read_snapshot(
     db: Any,
@@ -48,7 +56,11 @@ async def read_snapshot(
         except (TypeError, ValueError):
             continue
     refreshed_at = doc.get("refreshed_at")
-    if isinstance(refreshed_at, datetime) and refreshed_at.tzinfo is None:
+    if doc.get("schema_version") != SNAPSHOT_SCHEMA_VERSION:
+        # Legacy/unknown-shape snapshot — not a valid fresh snapshot, but
+        # still usable as the stale fallback when the source is down.
+        refreshed_at = None
+    elif isinstance(refreshed_at, datetime) and refreshed_at.tzinfo is None:
         refreshed_at = refreshed_at.replace(tzinfo=UTC)
     return participation, refreshed_at
 
@@ -60,6 +72,7 @@ async def write_snapshot(db: Any, participation: ParticipationMap) -> None:
             {"_id": worker_config.AI_ELIGIBILITY_SNAPSHOT_ID},
             {
                 "_id": worker_config.AI_ELIGIBILITY_SNAPSHOT_ID,
+                "schema_version": SNAPSHOT_SCHEMA_VERSION,
                 "participation": {
                     str(dept_id): info for dept_id, info in participation.items()
                 },
