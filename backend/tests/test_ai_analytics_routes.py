@@ -736,17 +736,21 @@ class TestAiEligibilityGating:
         left_grid = {b["label"]: b["count"] for b in stages[5]["breakdown"]}
         assert left_grid["Accepted / Released — Payment Received"] == 1
 
+    @pytest.mark.asyncio
     @patch("ai_analytics.outcome_service.sql_repo.get_claim_lifecycle_for_claims")
     @patch("ai_analytics.outcome_service.get_ai_participation_map", new_callable=AsyncMock)
     @patch("ai_analytics.outcome_service.projection_repo.get_projection_cohort", new_callable=AsyncMock)
     @patch("ai_analytics.outcome_service.sql_repo.get_cancellation_details_for_claims")
     @patch("ai_analytics.outcome_service.sql_repo.get_process_logs_for_claims")
-    def test_funnel_step1_matches_against_fee_catalog(
-        self, mock_logs, mock_canc, mock_mongo, mock_cohort, mock_part, test_client,
+    async def test_records_carry_fee_catalog_identification(
+        self, mock_logs, mock_canc, mock_cohort, mock_part, mock_life, test_client,
     ):
-        """With a real fee catalog on the participation map, a
-        category-only result resolves to the canonical category label and
-        a fee-item value matches its tile."""
+        """The funnel shows fee cards with dollar values (funnel-cleanup
+        design), while every normalized record still carries the
+        record-level ``fee_identification`` matched against the
+        department's current fee catalog — including cross-department
+        isolation (the same source label must not cross-match between
+        departments with different catalogs)."""
         participation = _participation()
         participation[1]["fee_catalog_version"] = 1
         participation[1]["fee_catalog"] = [
@@ -767,74 +771,84 @@ class TestAiEligibilityGating:
             ],
         }
         mock_part.return_value = participation
-        cohort = [
-            {"claim_id": 100, "AI_inv_process_status": 2, "dept_id": 1,
-             "ai_business_updated_at": "2026-01-15T10:00:00"},
-            {"claim_id": 200, "AI_inv_process_status": 2, "dept_id": 1,
-             "ai_business_updated_at": "2026-01-15T10:00:00"},
-            {"claim_id": 300, "AI_inv_process_status": 2, "dept_id": 2,
-             "ai_business_updated_at": "2026-01-15T10:00:00"},
-        ]
-        mock_cohort.return_value = cohort
-        mock_mongo.return_value = {
+        from tests.conftest import make_projection_doc
+        mock_cohort.return_value = [
             # Category-only result — a valid category selection.
-            100: {"claim_processing_status": "COMPLETED",
-                  "billing_category": "Structure Fires",
-                  "intake_status": "CATEGORY_ONLY"},
+            make_projection_doc(
+                100, sql_row={"dept_id": 1,
+                              "ai_business_updated_at": "2026-01-15T10:00:00"},
+                ai_record={"claim_processing_status": "COMPLETED",
+                           "billing_category": "Structure Fires",
+                           "intake_status": "CATEGORY_ONLY"},
+            ),
             # Item result, documented under its source-schedule label —
             # resolves to the canonical fee item via the alias.
-            200: {"claim_processing_status": "COMPLETED",
-                  "billing_category": "Structure Fires",
-                  "billing_level": "Vehicle fire response",
-                  "intake_status": "IDENTIFIED"},
+            make_projection_doc(
+                200, sql_row={"dept_id": 1,
+                              "ai_business_updated_at": "2026-01-15T10:00:00"},
+                ai_record={"claim_processing_status": "COMPLETED",
+                           "billing_category": "Structure Fires",
+                           "billing_level": "Vehicle fire response",
+                           "intake_status": "IDENTIFIED"},
+            ),
             # Identical dept-1 labels under dept 2's catalog → unmatched.
-            300: {"claim_processing_status": "COMPLETED",
-                  "billing_category": "Structure Fires",
-                  "billing_level": "Vehicle Fire"},
-        }
+            make_projection_doc(
+                300, sql_row={"dept_id": 2,
+                              "ai_business_updated_at": "2026-01-15T10:00:00"},
+                ai_record={"claim_processing_status": "COMPLETED",
+                           "billing_category": "Structure Fires",
+                           "billing_level": "Vehicle Fire"},
+            ),
+        ]
+        mock_life.return_value = {}
         mock_canc.return_value = {}
         mock_logs.return_value = {}
 
         response = test_client.get("/api/ai-analytics/outcomes/funnel", headers=AUTH)
         assert response.status_code == 200
         stages = response.json()
-        assert stages[2]["count"] == 3
-        breakdown = {
-            (b["label"], b["match_status"]): b
-            for b in stages[2]["breakdown"]
-        }
-        cat = breakdown[("Structure Fires", "category_matched")]
-        assert cat["count"] == 1
-        assert "Intake: Category identified" in cat["description"]
-        item = breakdown[("Structure Fires / Vehicle Fire", "matched")]
-        assert item["count"] == 1
-        # Dept 2's record keeps its raw label, explicitly unmatched.
-        other = breakdown[("Structure Fires / Vehicle Fire", "unmatched")]
-        assert other["count"] == 1
-        assert "Category identified (no level)" not in {
-            b["label"] for b in stages[2]["breakdown"]
-        }
-        assert sum(b["count"] for b in stages[2]["breakdown"]) == 3
-        counts = [s["count"] for s in stages]
-        assert counts == sorted(counts, reverse=True)
+        # The funnel's step-1 section is the fee card + dollar value
+        # breakdown (funnel-cleanup design), not the catalog match rows.
+        cards = {b["label"]: b["count"] for b in stages[0]["breakdown"]}
+        assert cards["Structure Fires"] == 1
+        assert cards["Vehicle fire response"] == 1
+        assert cards["Vehicle Fire"] == 1
 
-        # A department filter is forwarded to the SQL cohort and scopes the
-        # breakdown to that department's catalog results.
-        mock_cohort.return_value = cohort[:2]
+        # Record-level fee_identification is still matched against each
+        # department's catalog — asserted directly on the cohort records
+        # (no endpoint surfaces it yet; the funnel shows fee cards).
+        from ai_analytics.outcome_service import _load_normalized_cohort
+        from ai_analytics.models import AiAnalyticsFilters
+        records, _, _ = await _load_normalized_cohort(None, AiAnalyticsFilters())
+        by_id = {r["claim_id"]: r for r in records}
+        assert by_id[100]["fee_identification"] == {
+            "label": "Structure Fires",
+            "match_status": "category_matched",
+            "description": "Category matches current fee schedule",
+        }
+        assert by_id[200]["fee_identification"]["match_status"] == "matched"
+        assert by_id[200]["fee_identification"]["label"] == \
+            "Structure Fires / Vehicle Fire"
+        # Dept 2's record keeps its raw label, explicitly unmatched.
+        assert by_id[300]["fee_identification"]["match_status"] == "unmatched"
+        assert by_id[300]["fee_identification"]["label"] == \
+            "Structure Fires / Vehicle Fire"
+
+        # A department filter is forwarded to the projection cohort query;
+        # scope the mocked cohort to dept 1 to mirror the real filter.
+        mock_cohort.return_value = mock_cohort.return_value[:2]
         response = test_client.get(
             "/api/ai-analytics/outcomes/funnel?department_id=1", headers=AUTH
         )
         assert response.status_code == 200
         assert mock_cohort.call_args.kwargs["department_id"] == 1
         stages = response.json()
-        assert stages[2]["count"] == 2
-        assert {b["match_status"] for b in stages[2]["breakdown"]} == {
-            "category_matched", "matched"
-        }
+        assert stages[0]["count"] == 2
 
+    @pytest.mark.asyncio
+    @patch("ai_analytics.outcome_service.sql_repo.get_claim_lifecycle_for_claims")
     @patch("ai_analytics.outcome_service.get_ai_participation_map", new_callable=AsyncMock)
-    @patch("ai_analytics.outcome_service.sql_repo.get_ai_invoice_cohort")
-    @patch("ai_analytics.outcome_service.mongo_repo.get_ai_line_items_for_claim_ids", new_callable=AsyncMock)
+    @patch("ai_analytics.outcome_service.projection_repo.get_projection_cohort", new_callable=AsyncMock)
     @patch("ai_analytics.outcome_service.sql_repo.get_cancellation_details_for_claims")
     @patch("ai_analytics.outcome_service.sql_repo.get_process_logs_for_claims")
     def test_participation_unavailable_marks_unknown_not_disqualified(
