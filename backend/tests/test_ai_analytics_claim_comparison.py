@@ -4,6 +4,7 @@ SQL and Mongo are mocked. Production Azure SQL is not reachable from dev machine
 """
 
 import asyncio
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -169,7 +170,7 @@ def _ai_result(records=None, complete=True):
 
 def _run(scope_rows, versions_rows, records=None, deleted=0, ai_complete=True):
     """Run the service with SQL and AI cohort mocked."""
-    def fake_versions(chunk, column):
+    def fake_versions(chunk, column, as_of=None):
         assert column == ROW_START
         return [r for r in versions_rows if r["id"] in chunk]
 
@@ -449,7 +450,7 @@ class TestChunkingAndSql:
         rows = [r for i in range(1, 6) for r in _versions(i, ("Payment Received", "2026-02-10T10:00:00"))]
         with patch(f"{SQL}.get_claims_row_start_column", return_value=ROW_START), \
              patch(f"{SQL}.get_claim_comparison_scope", return_value=scope), \
-             patch(f"{SQL}.get_claim_status_versions", side_effect=lambda chunk, col: [
+             patch(f"{SQL}.get_claim_status_versions", side_effect=lambda chunk, col, as_of=None: [
                  r for r in rows if r["id"] in chunk]) as versions_mock, \
              patch(f"{SQL}.get_deleted_runs_count", return_value=0), \
              patch(f"{SERVICE}._load_normalized_cohort", new_callable=AsyncMock,
@@ -468,7 +469,7 @@ class TestChunkingAndSql:
         assert "h.id IN" in query
         assert "c.id IN" in query
         assert f"[{ROW_START}]" in query
-        assert params == {"claim_ids_csv": "1,2"}
+        assert params == {"claim_ids_csv": "1,2", "as_of": None}
 
     def test_scope_query_excludes_rural_metro_and_joins_run_types(self):
         with patch(f"{SQL}._execute_parameterized", return_value=[]) as execute:
@@ -566,10 +567,11 @@ class TestCacheWarmer:
 
     def test_warm_once_recomputes_and_primes_cache(self):
         fake_db = object()
+        result = SimpleNamespace(data_complete=True)
         with patch(f"{SERVICE}.resolve_comparison_window",
                    return_value=("2026-01-01", "2026-06-30")), \
              patch(f"{SERVICE}._compute_claim_payment_comparison",
-                   new_callable=AsyncMock, return_value="RESULT") as compute, \
+                   new_callable=AsyncMock, return_value=result) as compute, \
              patch(f"{SERVICE}.prime_cache") as prime:
             asyncio.run(svc._warm_once(fake_db))
         compute.assert_awaited_once()
@@ -578,8 +580,90 @@ class TestCacheWarmer:
         assert func_name == "get_claim_payment_comparison"
         assert args[0] is fake_db
         assert kwargs == {}
-        assert value == "RESULT"
+        assert value is result
         assert ttl == svc.CACHE_TTL_SECONDS
+
+    def test_warm_once_keeps_previous_cache_on_incomplete_result(self):
+        fake_db = object()
+        with patch(f"{SERVICE}.resolve_comparison_window",
+                   return_value=("2026-01-01", "2026-06-30")), \
+             patch(f"{SERVICE}._compute_claim_payment_comparison",
+                   new_callable=AsyncMock,
+                   return_value=SimpleNamespace(data_complete=False)), \
+             patch(f"{SERVICE}.touch_cache", return_value=True) as touch, \
+             patch(f"{SERVICE}.prime_cache") as prime:
+            asyncio.run(svc._warm_once(fake_db))
+        prime.assert_not_called()
+        touch.assert_called_once()
+
+    def test_cache_serves_stale_over_incomplete_recompute(self):
+        from ai_analytics import cache as cache_mod
+        calls = []
+
+        @cache_mod.cached(ttl=60, func_name="probe")
+        async def probe():
+            calls.append(1)
+            return SimpleNamespace(data_complete=False, n=len(calls))
+
+        with patch.object(cache_mod, "_is_testing", return_value=False):
+            cache_mod.clear_cache()
+            cache_mod.prime_cache("probe", (), {}, "GOOD", ttl=-1)  # already expired
+            # Expired entry + incomplete recompute -> stale value served once,
+            # then from the bounded retry window without recomputing.
+            assert asyncio.run(probe()) == "GOOD"
+            assert asyncio.run(probe()) == "GOOD"
+            assert len(calls) == 1
+            cache_mod.clear_cache()
+
+    def test_cache_does_not_store_incomplete_result(self):
+        from ai_analytics import cache as cache_mod
+        calls = []
+
+        @cache_mod.cached(ttl=60, func_name="probe2")
+        async def probe2():
+            calls.append(1)
+            return SimpleNamespace(data_complete=False, n=len(calls))
+
+        with patch.object(cache_mod, "_is_testing", return_value=False):
+            cache_mod.clear_cache()
+            first = asyncio.run(probe2())
+            second = asyncio.run(probe2())
+            # Nothing cached -> every call retries the source
+            assert len(calls) == 2
+            assert first.n == 1 and second.n == 2
+            cache_mod.clear_cache()
+
+    def test_touch_cache_extends_existing_entry(self):
+        from ai_analytics import cache as cache_mod
+        with patch.object(cache_mod, "_is_testing", return_value=False):
+            cache_mod.clear_cache()
+            cache_mod.prime_cache("probe", (1,), {}, "GOOD", ttl=-1)
+            assert cache_mod.touch_cache("probe", (1,), {}, ttl=3600) is True
+            expires_at, value = cache_mod._cache[list(cache_mod._cache)[0]]
+            assert value == "GOOD"
+            assert expires_at > 0
+            assert cache_mod.touch_cache("missing", (1,), {}, ttl=60) is False
+            # An incomplete entry must not be renewed — let it expire so
+            # requests retry the source.
+            cache_mod.prime_cache("bad", (), {}, SimpleNamespace(data_complete=False), ttl=60)
+            assert cache_mod.touch_cache("bad", (), {}, ttl=3600) is False
+            cache_mod.clear_cache()
+
+    def test_status_versions_bound_rows_before_grouping(self):
+        from datetime import datetime as dt
+        as_of = dt(2026, 7, 1, 7, 0, 0)
+        with patch(f"{SQL}._execute_parameterized", return_value=[]) as execute:
+            sql_repo.get_claim_status_versions([1, 2], ROW_START, as_of)
+        query, params = execute.call_args[0]
+        # The bound applies to each current/history row before GROUP BY, so a
+        # status that recurs after the window still reports its in-window max.
+        assert query.count("%(as_of)s") == 4
+        assert params["as_of"] is as_of
+
+    def test_status_versions_unbounded_by_default(self):
+        with patch(f"{SQL}._execute_parameterized", return_value=[]) as execute:
+            sql_repo.get_claim_status_versions([1], ROW_START)
+        assert execute.call_args[0][1]["as_of"] is None
 
 
 # ---------------------------------------------------------------------------

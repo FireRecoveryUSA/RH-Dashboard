@@ -63,7 +63,7 @@ from .claim_status_config import (
     incident_type_label,
     is_mapped_claim_status,
 )
-from .cache import cached, prime_cache
+from .cache import cached, prime_cache, touch_cache
 
 logger = logging.getLogger(__name__)
 
@@ -160,7 +160,7 @@ def _fetch_status_versions(
     versions: Dict[int, List[Tuple[str, str, datetime, bool]]] = defaultdict(list)
     unmapped: Counter = Counter()
     for chunk in _chunks(claim_ids, HISTORY_CHUNK_SIZE):
-        for row in sql_repo.get_claim_status_versions(chunk, row_start_column):
+        for row in sql_repo.get_claim_status_versions(chunk, row_start_column, as_of):
             claim_id = row.get("id")
             last_start = row.get("last_start")
             if claim_id is None or not last_start:
@@ -526,6 +526,25 @@ async def _warm_once(ai_db) -> None:
         department_id=None,
     )
     value = await _compute_claim_payment_comparison(ai_db, filters)
+    if not value.data_complete:
+        # Don't overwrite the last good entry with an empty result from a
+        # transient outage — and extend its expiry so requests keep being
+        # served from cache instead of triggering a cold history read that
+        # would exceed the proxy timeout before the next warm runs.
+        if touch_cache(
+            "get_claim_payment_comparison",
+            (ai_db, filters),
+            {},
+            CACHE_TTL_SECONDS,
+        ):
+            logger.warning(
+                "Claim comparison warm produced an incomplete result; extended previous cache entry"
+            )
+        else:
+            logger.warning(
+                "Claim comparison warm produced an incomplete result; no cache entry to keep"
+            )
+        return
     prime_cache(
         "get_claim_payment_comparison",
         (ai_db, filters),
