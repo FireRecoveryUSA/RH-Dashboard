@@ -251,11 +251,13 @@ class TestEffectiveStatus:
         assert resp.overall.paid == 0
         assert all(w.other_manual.paid == 0 for w in resp.weekly)
 
-    def test_all_versions_after_end_date_is_unresolved(self):
+    def test_all_versions_after_end_date_is_excluded(self):
+        # The claim's earliest activity is after the window — it hasn't
+        # entered the process yet, so it is not part of the payload.
         rows = _versions(1, ("Payment Received", "2026-07-15T10:00:00"))
         resp = _run([_scope_row(1)], rows)
         assert resp.overall.total == 0
-        assert resp.unresolved_claims == 1
+        assert resp.unresolved_claims == 0
 
     def test_future_billing_statuses_do_not_set_target(self):
         rows = _versions(
@@ -335,6 +337,41 @@ class TestCohorts:
     def test_run_outside_ai_cohort_is_manual(self):
         resp = _run([_scope_row(9)], _versions(9, ("Under Review", "2026-02-10T10:00:00")))
         assert resp.other_manual.under_review == 1
+        assert resp.ai_released.total == 0
+
+
+class TestProcessEntryGate:
+    def test_manual_claim_entered_before_window_is_excluded(self):
+        # Earliest activity (assignment) is before the window — the claim
+        # entered the process prior to the cutoff, so it drops out even
+        # though the SQL scope returned it.
+        rows = _versions(
+            1,
+            ("Assigned", "2025-12-01T10:00:00"),
+            ("Payment Received", "2026-03-01T10:00:00"),
+        )
+        resp = _run([_scope_row(1)], rows)
+        assert resp.overall.total == 0
+
+    def test_manual_claim_with_no_versions_is_excluded(self):
+        # Nothing marks an entry into the process — submission alone is
+        # not enough to count the claim.
+        resp = _run([_scope_row(1)], [])
+        assert resp.overall.total == 0
+        assert resp.unresolved_claims == 0
+
+    def test_ai_claim_outside_sql_scope_still_counts(self):
+        # AI-processed in the window via business_status_date even though
+        # the SQL scope never returned it (e.g. submitted before the window).
+        record = _record(7, RELEASED, business_status_date="2026-03-05")
+        rows = _versions(7, ("Payment Received", "2026-03-10T10:00:00"))
+        resp = _run([], rows, records=[record])
+        assert resp.ai_released.paid == 1
+
+    def test_ai_record_before_window_is_excluded(self):
+        record = _record(7, RELEASED, business_status_date="2025-12-20")
+        rows = _versions(7, ("Payment Received", "2026-03-10T10:00:00"))
+        resp = _run([], rows, records=[record])
         assert resp.ai_released.total == 0
 
 
@@ -514,10 +551,15 @@ class TestChunkingAndSql:
 
     def test_scope_query_excludes_rural_metro_and_joins_run_types(self):
         with patch(f"{SQL}._execute_parameterized", return_value=[]) as execute:
-            sql_repo.get_claim_comparison_scope("2026-01-01", "2026-06-30", None)
+            sql_repo.get_claim_comparison_scope("2026-01-01", "2026-06-30", None, ROW_START, None, None)
         query, _ = execute.call_args.args
         assert "NOT IN (1136,2198,2627,2628,2629)" in query
         assert "c.submitted = 1" in query
+        # Candidates include claims with status activity at/after the window
+        # start, regardless of submission date — bounded on both ends.
+        assert "AuditData.claimsHistory" in query
+        assert "%(start_utc)s" in query
+        assert "%(end_utc)s" in query
         assert "c.original_run_id IS NOT NULL" in query
         assert "LEFT JOIN dbo.run_types rt ON rt.id = c.type_id" in query
         assert "incidents_billing" not in query

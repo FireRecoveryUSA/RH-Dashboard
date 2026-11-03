@@ -610,8 +610,19 @@ def get_claim_comparison_scope(
     start_date: str,
     end_date: str,
     department_id: Optional[int],
+    row_start_column: str,
+    start_utc: Any,
+    end_utc: Any,
 ) -> List[Dict[str, Any]]:
-    """In-scope runs submitted in the window, excluding Rural Metro departments."""
+    """Candidate runs for the claim comparison, excluding Rural Metro.
+
+    The payload gate is when a claim entered the line-item process, not
+    ``date_of_submitted``. A claim is a candidate when it was submitted inside
+    the window OR has any status version (current row or history) starting at
+    or after the UTC window start — ``row_start`` values are UTC. The caller
+    applies the exact entry-date gate per claim.
+    """
+    row_start = _quote_identifier(row_start_column)
     query = f"""
     SELECT
         c.id,
@@ -624,11 +635,29 @@ def get_claim_comparison_scope(
     FROM dbo.Claims c
     LEFT JOIN dbo.Departments d ON d.ID = c.dept_id
     LEFT JOIN dbo.run_types rt ON rt.id = c.type_id
-    WHERE {_CLAIM_SCOPE_WHERE}
+    WHERE c.submitted = 1
+      AND c.original_run_id IS NOT NULL
+      AND c.date_of_submitted < DATEADD(day, 1, %(end_date)s)
+      AND (%(department_id)s IS NULL OR c.dept_id = %(department_id)s)
+      AND (c.dept_id IS NULL OR c.dept_id NOT IN ({_EXCLUDED_DEPT_SQL}))
+      AND (
+        c.date_of_submitted >= %(start_date)s
+        OR (c.{row_start} >= %(start_utc)s AND c.{row_start} < %(end_utc)s)
+        OR c.id IN (
+            SELECT h.id FROM AuditData.claimsHistory h
+            WHERE h.{row_start} >= %(start_utc)s AND h.{row_start} < %(end_utc)s
+        )
+      )
     """
     return _execute_parameterized(
         query,
-        {"start_date": start_date, "end_date": end_date, "department_id": department_id},
+        {
+            "start_date": start_date,
+            "end_date": end_date,
+            "department_id": department_id,
+            "start_utc": start_utc,
+            "end_utc": end_utc,
+        },
     )
 
 
