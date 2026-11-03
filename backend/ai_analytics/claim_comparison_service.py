@@ -119,6 +119,15 @@ def _chunks(items: List[int], size: int) -> Iterator[List[int]]:
         yield items[i:i + size]
 
 
+def _dept_excluded(record: Dict[str, Any]) -> bool:
+    """Whether the record's department is one the SQL scope excludes (Rural
+    Metro). Projection department IDs can arrive as strings — normalize."""
+    try:
+        return int(record.get("department_id")) in EXCLUDED_DEPARTMENT_IDS
+    except (TypeError, ValueError):
+        return False
+
+
 def _cohort_for(record: Optional[Dict[str, Any]]) -> Tuple[str, Optional[str]]:
     if record is None:
         return COHORT_OTHER, SUBTYPE_MANUAL
@@ -466,7 +475,7 @@ async def _compute_claim_payment_comparison(
         return _empty_result(start, end, source_status)
     ai_by_claim = {
         int(r["claim_id"]): r for r in records
-        if r.get("claim_id") and r.get("department_id") not in EXCLUDED_DEPARTMENT_IDS
+        if r.get("claim_id") and not _dept_excluded(r)
     }
 
     # Candidates = SQL scope rows ∪ AI-cohort claims. An AI-processed claim
@@ -554,11 +563,7 @@ async def _compute_claim_payment_comparison(
                 for _, b, row_start, _, _fs in claim_versions
                 if row_start < as_of
             ),
-            incident=incident_type_label(
-                row.get("type_id") if row.get("type_id") is not None
-                else (record or {}).get("run_type_id"),
-                row.get("type_name"),
-            ),
+            incident=incident_type_label(row.get("type_id"), row.get("type_name")),
             billing_target=billing_target_from_statuses(
                 (status, last_start, is_current)
                 for status, _, last_start, is_current, _fs in claim_versions
