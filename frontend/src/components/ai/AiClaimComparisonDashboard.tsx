@@ -69,10 +69,10 @@ const sectionTitleStyle: React.CSSProperties = {
 
 const pct = (value: number | null): string => (value === null ? '—' : formatPercent(value));
 
-// Shares are over the whole displayed population; `total` counts only
-// finished claims, so not-billable is added back for per-status shares.
+// Shares are over the whole displayed population: `total` covers only
+// finished claims, so the other displayed buckets are added back.
 const share = (count: number, b: ClaimStatusBreakdown): string => {
-  const population = b.total + b.not_billable;
+  const population = b.total + b.not_billable + b.under_review + b.in_progress;
   return population > 0 ? `${((count / population) * 100).toFixed(1)}%` : '—';
 };
 

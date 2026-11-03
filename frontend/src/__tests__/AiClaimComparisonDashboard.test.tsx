@@ -152,6 +152,14 @@ describe('AiClaimComparisonDashboard', () => {
     expect(screen.getAllByText('100.0%').length).toBeGreaterThanOrEqual(1);
   });
 
+  test('status shares divide by the whole displayed population', async () => {
+    render(<AiClaimComparisonDashboard />);
+    await waitFor(() => expect(screen.getByText('Final Payment Outcome by Cohort')).toBeInTheDocument());
+    // other_manual: total 3 + under_review 1 = population 4 -> paid share 1/4 = 25.0%
+    // (under_review/in_progress columns must not inflate shares past 100%)
+    expect(screen.getAllByText('(25.0%)').length).toBeGreaterThanOrEqual(1);
+  });
+
   test('renders AI-released vs other cohort breakdown with manual and AI-rejected split', async () => {
     render(<AiClaimComparisonDashboard />);
     await waitFor(() => expect(screen.getByText('Final Payment Outcome by Cohort')).toBeInTheDocument());
