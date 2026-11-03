@@ -24,7 +24,9 @@ dashboards.
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import os
 from collections import Counter, defaultdict
 from datetime import date, datetime, timedelta
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
@@ -65,6 +67,11 @@ from .cache import cached
 logger = logging.getLogger(__name__)
 
 HISTORY_CHUNK_SIZE = 2000
+
+# Cache TTL is longer than the default warm interval so a request between two
+# warm runs still hits the cache instead of recomputing against a cold SQL
+# buffer cache (a cold history read exceeds the proxy's 180s timeout).
+CACHE_TTL_SECONDS = 900
 
 COHORT_AI_RELEASED = "ai_released"
 COHORT_OTHER = "other"
@@ -112,8 +119,13 @@ def _cohort_for(record: Optional[Dict[str, Any]]) -> Tuple[str, Optional[str]]:
 
 def _effective_state(
     versions: Iterable[Tuple[str, str, datetime, bool]],
+    as_of: Optional[datetime] = None,
 ) -> Optional[Tuple[str, datetime]]:
     """Latest non-archive (bucket, row_start) from (status, bucket, row_start, is_current).
+
+    ``as_of`` caps the state at the end of the comparison window: versions
+    recorded after it are ignored, so a past window never includes future
+    payment outcomes.
 
     When two statuses share the same latest row start, the live Claims row wins:
     it is the authoritative current state. Without this, the choice depends on
@@ -123,6 +135,8 @@ def _effective_state(
     best_key: Optional[Tuple[datetime, bool]] = None
     for _status, bucket, row_start, is_current in versions:
         if bucket == BUCKET_ARCHIVE:
+            continue
+        if as_of is not None and row_start >= as_of:
             continue
         key = (row_start, is_current)
         if best_key is None or key > best_key:
@@ -341,7 +355,7 @@ def _empty_result(
     )
 
 
-@cached(ttl=300, func_name="get_claim_payment_comparison")
+@cached(ttl=CACHE_TTL_SECONDS, func_name="get_claim_payment_comparison")
 async def get_claim_payment_comparison(
     ai_db,
     filters: AiAnalyticsFilters,
@@ -357,8 +371,9 @@ async def get_claim_payment_comparison(
     source_status: Dict[str, str] = {"recoveryhub_sql": "available"}
 
     try:
-        row_start_column = sql_repo.get_claims_row_start_column()
-        scope_rows = sql_repo.get_claim_comparison_scope(
+        row_start_column = await asyncio.to_thread(sql_repo.get_claims_row_start_column)
+        scope_rows = await asyncio.to_thread(
+            sql_repo.get_claim_comparison_scope,
             filters.start_date,
             filters.end_date,
             filters.department_id,
@@ -377,6 +392,14 @@ async def get_claim_payment_comparison(
         ),
     )
     source_status.update(ai_source_status)
+    if ai_source_status.get("recoveryhub_ai_mongo") == "unavailable":
+        # Without the AI cohort every run would classify as manual, which
+        # inflates the manual cohort with AI-released runs. Report the
+        # comparison as incomplete instead of returning wrong rates.
+        logger.error(
+            "Claim comparison AI cohort unavailable; returning incomplete result"
+        )
+        return _empty_result(start, end, source_status)
     ai_by_claim = {int(r["claim_id"]): r for r in records if r.get("claim_id")}
 
     tracked: List[Tuple[int, str, Optional[str], Optional[Dict[str, Any]], Dict[str, Any]]] = []
@@ -393,8 +416,10 @@ async def get_claim_payment_comparison(
         tracked.append((claim_id, cohort, subtype, record, row))
 
     try:
-        versions, unmapped = _fetch_status_versions(
-            [t[0] for t in tracked], row_start_column,
+        versions, unmapped = await asyncio.to_thread(
+            _fetch_status_versions,
+            [t[0] for t in tracked],
+            row_start_column,
         )
     except Exception as e:
         logger.error(f"Claim comparison status history query failed: {e}")
@@ -403,18 +428,24 @@ async def get_claim_payment_comparison(
 
     deleted_runs = 0
     try:
-        deleted_runs = sql_repo.get_deleted_runs_count(
-            filters.start_date, filters.end_date, filters.department_id,
+        deleted_runs = await asyncio.to_thread(
+            sql_repo.get_deleted_runs_count,
+            filters.start_date,
+            filters.end_date,
+            filters.department_id,
         )
     except Exception as e:
         logger.error(f"Claim comparison deleted-runs query failed: {e}")
         source_status["recoveryhub_sql"] = "partial"
         data_complete = False
 
+    # Cap the effective state at the end of the window (inclusive dates).
+    as_of = datetime(end.year, end.month, end.day) + timedelta(days=1)
+
     outcomes: List[_ClaimOutcome] = []
     for claim_id, cohort, subtype, record, row in tracked:
         claim_versions = versions.get(claim_id, [])
-        effective = _effective_state(claim_versions)
+        effective = _effective_state(claim_versions, as_of)
         system_not_billable = record is not None and classify_billability(
             billing_category=None,
             is_billable=record.get("is_billable"),
@@ -427,7 +458,9 @@ async def get_claim_payment_comparison(
             ever_not_billable=any(b == BUCKET_NOT_BILLABLE for _, b, _, _ in claim_versions),
             incident=incident_type_label(row.get("type_id"), row.get("type_name")),
             billing_target=billing_target_from_statuses(
-                (status, last_start) for status, _, last_start, _ in claim_versions
+                (status, last_start)
+                for status, _, last_start, _ in claim_versions
+                if last_start < as_of
             ),
             system_not_billable=bool(system_not_billable),
         ))
@@ -441,6 +474,42 @@ async def get_claim_payment_comparison(
     )
 
 
+async def warm_claim_comparison_cache(
+    ai_db,
+    interval_seconds: Optional[int] = None,
+) -> None:
+    """Keep the default-window comparison cached so requests never recompute.
+
+    A cold history read takes about 230 s, longer than the proxy's 180 s
+    timeout, so the first request after an idle period would return a 504.
+    Running the cached lookup on a schedule keeps both the app cache and the
+    SQL buffer cache warm. ``interval_seconds`` defaults to
+    CLAIM_COMPARISON_WARM_INTERVAL_SECONDS (600); 0 disables warming.
+    """
+    if interval_seconds is None:
+        interval_seconds = int(
+            os.environ.get("CLAIM_COMPARISON_WARM_INTERVAL_SECONDS", "600")
+        )
+    if interval_seconds <= 0:
+        logger.info("Claim comparison cache warming disabled")
+        return
+    while True:
+        try:
+            start, end = await asyncio.to_thread(resolve_comparison_window, None)
+            filters = AiAnalyticsFilters(
+                start_date=start,
+                end_date=end,
+                department_id=None,
+            )
+            await get_claim_payment_comparison(ai_db, filters)
+            logger.info("Claim comparison cache warmed")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(f"Claim comparison cache warm failed: {e}")
+        await asyncio.sleep(interval_seconds)
+
+
 async def get_claim_comparison_schema_check(
     start_date: str,
     end_date: str,
@@ -452,11 +521,17 @@ async def get_claim_comparison_schema_check(
     """
     start = date.fromisoformat(start_date)
     end = date.fromisoformat(end_date)
-    row_start_column = sql_repo.get_claims_row_start_column()
+    row_start_column = await asyncio.to_thread(sql_repo.get_claims_row_start_column)
 
-    status_rows = sql_repo.get_scope_status_counts(start_date, end_date)
-    run_type_rows = sql_repo.get_run_type_values(start_date, end_date)
-    deleted_columns = sql_repo.get_table_column_names("claims_deleted")
+    status_rows = await asyncio.to_thread(
+        sql_repo.get_scope_status_counts, start_date, end_date,
+    )
+    run_type_rows = await asyncio.to_thread(
+        sql_repo.get_run_type_values, start_date, end_date,
+    )
+    deleted_columns = await asyncio.to_thread(
+        sql_repo.get_table_column_names, "claims_deleted",
+    )
 
     return AiClaimComparisonSchemaCheck(
         period_start=start.isoformat(),

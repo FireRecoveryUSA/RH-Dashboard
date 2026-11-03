@@ -220,6 +220,34 @@ class TestEffectiveStatus:
         assert resp.overall.total == 0
         assert resp.unresolved_claims == 1
 
+    def test_versions_after_end_date_are_ignored(self):
+        rows = _versions(
+            1,
+            ("Under Review", "2026-02-01T10:00:00"),
+            ("Payment Received", "2026-07-15T10:00:00"),
+        )
+        resp = _run([_scope_row(1)], rows)
+        assert resp.overall.under_review == 1
+        assert resp.overall.paid == 0
+        assert all(w.other_manual.paid == 0 for w in resp.weekly)
+
+    def test_all_versions_after_end_date_is_unresolved(self):
+        rows = _versions(1, ("Payment Received", "2026-07-15T10:00:00"))
+        resp = _run([_scope_row(1)], rows)
+        assert resp.overall.total == 0
+        assert resp.unresolved_claims == 1
+
+    def test_future_billing_statuses_do_not_set_target(self):
+        rows = _versions(
+            1,
+            ("Under Review", "2026-02-01T10:00:00"),
+            ("Invoiced Insurance", "2026-07-15T10:00:00"),
+        )
+        resp = _run([_scope_row(1)], rows)
+        labels = {s.label: s for s in resp.by_billing_target}
+        assert labels["Unknown"].overall.total == 1
+        assert "Insurance" not in labels
+
 
 class TestEffectiveStatusTies:
     @pytest.mark.parametrize("reverse", [False, True])
@@ -445,6 +473,39 @@ class TestChunkingAndSql:
     def test_ai_side_incomplete_marks_data_incomplete(self):
         resp = _run([_scope_row(1)], [], ai_complete=False)
         assert resp.data_complete is False
+
+    def test_ai_mongo_unavailable_returns_incomplete_empty_result(self):
+        with patch(f"{SQL}.get_claims_row_start_column", return_value=ROW_START), \
+             patch(f"{SQL}.get_claim_comparison_scope",
+                   return_value=[_scope_row(1)]), \
+             patch(f"{SERVICE}._load_normalized_cohort", new_callable=AsyncMock,
+                   return_value=(
+                       [],
+                       {"recoveryhub_sql": "available",
+                        "recoveryhub_ai_mongo": "unavailable"},
+                       False,
+                   )):
+            resp = asyncio.run(svc.get_claim_payment_comparison(None, _filters()))
+        assert resp.data_complete is False
+        assert resp.source_status["recoveryhub_ai_mongo"] == "unavailable"
+        # No cohort data must not misclassify every run as manual.
+        assert resp.other_manual.total == 0
+        assert resp.overall.total == 0
+
+    def test_deleted_runs_filters_date_of_submitted_with_created_fallback(self):
+        calls = []
+
+        def fake_execute(query, params):
+            calls.append(query)
+            if "date_of_submitted" in query:
+                raise RuntimeError("no such column")
+            return [{"deleted_runs": 4}]
+
+        with patch(f"{SQL}._execute_parameterized", side_effect=fake_execute):
+            assert sql_repo.get_deleted_runs_count("2026-01-01", "2026-06-30", None) == 4
+        assert len(calls) == 2
+        assert "x.date_of_submitted" in calls[0]
+        assert "x.created" in calls[1]
 
     def test_deleted_query_failure_marks_partial(self):
         with patch(f"{SQL}.get_claims_row_start_column", return_value=ROW_START), \
