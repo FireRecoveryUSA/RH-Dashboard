@@ -72,7 +72,9 @@ const pct = (value: number | null): string => (value === null ? '—' : formatPe
 const share = (count: number, total: number): string =>
   total > 0 ? `${((count / total) * 100).toFixed(1)}%` : '—';
 
-const ratedCount = (b: ClaimStatusBreakdown): number => b.total - b.not_billable;
+// Claims that finished the process — the rate denominator (paid + ready + denied).
+const finishedCount = (b: ClaimStatusBreakdown): number =>
+  b.paid + b.ready_to_be_paid + b.denied;
 
 const SectionCard: React.FC<{ title: string; children: React.ReactNode }> = ({ title, children }) => (
   <div style={billingStyles.card}>
@@ -146,8 +148,9 @@ const CohortStatusTable: React.FC<{ data: AiClaimComparisonResponse }> = ({ data
         </table>
       </div>
       <div style={{ marginTop: '10px', fontSize: '11px', color: 'var(--text-muted)' }}>
-        Rates exclude not billable claims. Success = paid + ready to be paid. AI-pending claims
-        ({data.ai_pending.toLocaleString()}) are excluded from all rates.
+        Rates divide by claims that finished the process (paid + ready to be paid + denied).
+        In-progress, under-review, and not billable claims are excluded from denominators;
+        AI-pending claims ({data.ai_pending.toLocaleString()}) are excluded from all rates.
       </div>
     </SectionCard>
   );
@@ -500,7 +503,7 @@ export const AiClaimComparisonDashboard: React.FC = () => {
           label="Overall Paid Rate"
           value={pct(data.overall.paid_rate)}
           icon={<Activity size={20} />}
-          subtitle={`${data.overall.paid.toLocaleString()} paid of ${ratedCount(data.overall).toLocaleString()} rated`}
+          subtitle={`${(data.overall.paid + data.overall.ready_to_be_paid).toLocaleString()} paid-ready of ${finishedCount(data.overall).toLocaleString()} finished`}
         />
         <KpiCard
           label="AI-Released Paid Rate"

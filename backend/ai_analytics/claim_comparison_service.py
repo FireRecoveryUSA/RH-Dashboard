@@ -61,7 +61,6 @@ from .claim_status_config import (
     BUCKET_PAID,
     BUCKET_READY_TO_BE_PAID,
     BUCKET_UNDER_REVIEW,
-    RATED_BUCKETS,
     billing_target_from_statuses,
     billing_target_label,
     classify_claim_status,
@@ -222,18 +221,20 @@ def _breakdown(outcomes: List[_ClaimOutcome]) -> ClaimStatusBreakdown:
     paid = counts[BUCKET_PAID]
     ready = counts[BUCKET_READY_TO_BE_PAID]
     denied = counts[BUCKET_DENIED]
-    rated = sum(counts[b] for b in RATED_BUCKETS)
+    # Rates only divide by claims that finished the process (paid, ready to
+    # be paid, denied). in_progress and under_review still appear in `total`
+    # and their own columns; not billable never counts toward `total`.
     successes = paid + ready
     final = successes + denied
     return ClaimStatusBreakdown(
-        total=len(resolved),
+        total=len(resolved) - counts[BUCKET_NOT_BILLABLE],
         paid=paid,
         ready_to_be_paid=ready,
         under_review=counts[BUCKET_UNDER_REVIEW],
         in_progress=counts[BUCKET_IN_PROGRESS],
         denied=denied,
         not_billable=counts[BUCKET_NOT_BILLABLE],
-        paid_rate=_pct(paid, rated),
+        paid_rate=_pct(successes, final),
         resolved_success_rate=_pct(successes, final),
         denied_rate=_pct(denied, final),
     )
