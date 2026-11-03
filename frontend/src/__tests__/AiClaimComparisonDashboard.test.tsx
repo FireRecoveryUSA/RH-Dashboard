@@ -44,10 +44,12 @@ const WEEK_COUNTS = (overrides: Record<string, number | null> = {}) => ({
 const COMPARISON = {
   period_start: '2026-01-01',
   period_end: '2026-08-13',
-  overall: breakdown({ total: 9, paid: 4, ready_to_be_paid: 2, denied: 1, under_review: 1, in_progress: 1, not_billable: 1, paid_rate: 85.71, resolved_success_rate: 85.71, denied_rate: 14.29 }),
-  ai_released: breakdown({ total: 5, paid: 3, ready_to_be_paid: 1, denied: 0, in_progress: 1, paid_rate: 100.0, resolved_success_rate: 100.0, denied_rate: 0.0 }),
-  other: breakdown({ total: 4, paid: 1, ready_to_be_paid: 1, denied: 1, under_review: 1, not_billable: 1, paid_rate: 66.67, resolved_success_rate: 66.67, denied_rate: 33.33 }),
-  other_manual: breakdown({ total: 3, paid: 1, ready_to_be_paid: 1, under_review: 1, paid_rate: 100.0, resolved_success_rate: 100.0, denied_rate: 0.0 }),
+  // `total` = finished claims only (paid + ready + denied), matching the
+  // backend contract after this PR.
+  overall: breakdown({ total: 7, paid: 4, ready_to_be_paid: 2, denied: 1, under_review: 1, in_progress: 1, not_billable: 1, paid_rate: 85.71, resolved_success_rate: 85.71, denied_rate: 14.29 }),
+  ai_released: breakdown({ total: 4, paid: 3, ready_to_be_paid: 1, denied: 0, in_progress: 1, paid_rate: 100.0, resolved_success_rate: 100.0, denied_rate: 0.0 }),
+  other: breakdown({ total: 3, paid: 1, ready_to_be_paid: 1, denied: 1, under_review: 1, not_billable: 1, paid_rate: 66.67, resolved_success_rate: 66.67, denied_rate: 33.33 }),
+  other_manual: breakdown({ total: 2, paid: 1, ready_to_be_paid: 1, under_review: 1, paid_rate: 100.0, resolved_success_rate: 100.0, denied_rate: 0.0 }),
   other_ai_rejected: breakdown({ total: 1, denied: 1, not_billable: 1, paid_rate: 0.0, resolved_success_rate: 0.0, denied_rate: 100.0 }),
   ai_pending: 7,
   deleted_runs: 4,
@@ -150,6 +152,14 @@ describe('AiClaimComparisonDashboard', () => {
     expect(screen.getAllByText('4').length).toBeGreaterThanOrEqual(1);
     expect(screen.getAllByText('7').length).toBeGreaterThanOrEqual(1);
     expect(screen.getAllByText('100.0%').length).toBeGreaterThanOrEqual(1);
+  });
+
+  test('status shares divide by the whole displayed population', async () => {
+    render(<AiClaimComparisonDashboard />);
+    await waitFor(() => expect(screen.getByText('Final Payment Outcome by Cohort')).toBeInTheDocument());
+    // other_manual: total 2 + under_review 1 = population 3 -> paid share 1/3 = 33.3%
+    // (under_review/in_progress columns must not inflate shares past 100%)
+    expect(screen.getAllByText('(33.3%)').length).toBeGreaterThanOrEqual(1);
   });
 
   test('renders AI-released vs other cohort breakdown with manual and AI-rejected split', async () => {

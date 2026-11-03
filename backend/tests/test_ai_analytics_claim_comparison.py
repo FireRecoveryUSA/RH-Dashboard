@@ -265,7 +265,9 @@ class TestEffectiveStatus:
         )
         resp = _run([_scope_row(1)], rows)
         labels = {s.label: s for s in resp.by_billing_target}
-        assert labels["Unknown"].overall.total == 1
+        # Under-review is not a finished claim, so it never makes up a total.
+        assert labels["Unknown"].overall.under_review == 1
+        assert labels["Unknown"].overall.total == 0
         assert "Insurance" not in labels
 
     def test_not_billable_after_end_date_is_ignored(self):
@@ -396,9 +398,10 @@ class TestWeeklyAndRates:
         )
         resp = _run(scope, rows, deleted=3)
         assert resp.deleted_runs == 3
-        assert resp.overall.total == 2
-        # Rate denominator is finished claims only (paid + ready + denied);
-        # the under-review claim counts toward total, not the rate.
+        # Total is finished claims only (paid + ready + denied); the
+        # under-review claim shows in its column but not the total or rates.
+        assert resp.overall.total == 1
+        assert resp.overall.under_review == 1
         assert resp.overall.paid_rate == 100.0
 
     def test_rate_denominator_is_finished_claims_only(self):
@@ -410,9 +413,10 @@ class TestWeeklyAndRates:
             + _versions(4, ("Unbillable", "2026-02-10T10:00:00"))
         )
         resp = _run(scope, rows)
-        # Not-billable is excluded from the total; in-flight statuses count
-        # toward it but not toward rate denominators.
-        assert resp.overall.total == 3
+        # Only finished claims make up the total: paid + denied here.
+        # Under-review and not-billable show in their columns, never in total.
+        assert resp.overall.total == 2
+        assert resp.overall.under_review == 1
         assert resp.overall.not_billable == 1
         assert resp.overall.paid_rate == 50.0  # (paid+ready)/(paid+ready+denied)
         assert resp.overall.denied_rate == 50.0
