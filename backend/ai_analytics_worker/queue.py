@@ -301,6 +301,16 @@ async def run_queue_consumer(
                 if claims_since_yield >= max_claims_per_cycle:
                     await asyncio.sleep(0)
                     claims_since_yield = 0
+            # INFO (not DEBUG): sync_integrity and reconciliation only log
+            # their *enqueue* at INFO, so without this line an operator sees
+            # "enqueued N divergent claims" and then silence at the default
+            # log level, which reads as a stuck pipeline even though the
+            # refreshes succeeded silently.
+            logger.info(
+                "Queue consumer: refreshed %d claim(s) this cycle (sources: %s).",
+                len(ready),
+                ", ".join(sorted({s for _, s in ready})),
+            )
             continue
 
         # Nothing ready — check if we should exit.
