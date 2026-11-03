@@ -34,10 +34,24 @@ from ai_analytics_routes import ai_analytics_router
 from ai_analytics_worker.config import worker_config
 from ai_analytics_worker.routes import worker_router
 from ai_analytics_worker import runtime as worker_runtime
+from ai_analytics.claim_comparison_service import warm_claim_comparison_cache
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+_comparison_warm_task: asyncio.Task | None = None
+
+
+async def _run_claim_comparison_warmer() -> None:
+    """Keeps the claim payment comparison cache warm (see service docstring)."""
+    try:
+        await warm_claim_comparison_cache(db_manager.ai_db)
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        logger.error(f"Claim comparison cache warmer exited: {e}")
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -72,6 +86,10 @@ async def lifespan(app: FastAPI):
                 on_leader_acquired=_run_worker_backfill_if_needed,
             )
             logger.info("AI Analytics Worker task started.")
+        # Keep the claim payment comparison cache warm: a cold read exceeds
+        # the proxy timeout, so requests must hit a pre-computed result.
+        global _comparison_warm_task
+        _comparison_warm_task = asyncio.create_task(_run_claim_comparison_warmer())
     except Exception as e:
         logger.critical(f"Database Initialization Failed during startup: {e}")
         # Fail loudly to prevent running app in unconfigured state
@@ -80,6 +98,12 @@ async def lifespan(app: FastAPI):
     yield
 
     # Clean disconnect on shutdown
+    if _comparison_warm_task is not None:
+        _comparison_warm_task.cancel()
+        try:
+            await _comparison_warm_task
+        except asyncio.CancelledError:
+            pass
     # Stop the AI Analytics Worker first — it must drain within
     # CANCELLATION_TIMEOUT_SECONDS (5s) per the Phase 0 plan Section 1.1.4.
     logger.info("Stopping AI Analytics Worker task...")
