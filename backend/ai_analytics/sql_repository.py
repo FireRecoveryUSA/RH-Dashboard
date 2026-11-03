@@ -592,6 +592,7 @@ def get_claims_row_start_column() -> str:
     FROM sys.tables t
     INNER JOIN sys.columns c ON c.object_id = t.object_id
     WHERE t.name = 'Claims'
+      AND SCHEMA_NAME(t.schema_id) = 'dbo'
       AND c.generated_always_type_desc = 'AS_ROW_START'
     """
     rows = _execute_raw_sql(query)
@@ -673,34 +674,28 @@ def get_deleted_runs_count(
     """Deleted runs submitted in the window (dbo.claims_deleted), excluding Rural Metro.
 
     Filters ``date_of_submitted`` to match the live scope query, so a run
-    created last year and submitted this year is still counted. Falls back to
-    ``created`` when claims_deleted lacks the column (its schema is not fully
-    verified; the schema-check endpoint reports the table's columns).
+    created last year and submitted this year is still counted. Uses
+    ``created`` when claims_deleted lacks that column — the column is chosen
+    once up front from the table's metadata, so a transient query failure can
+    never silently swap the metric's date semantics.
     """
-    for date_column in ("date_of_submitted", "created"):
-        query = f"""
-        SELECT COUNT(DISTINCT x.id) AS deleted_runs
-        FROM dbo.claims_deleted x
-        WHERE x.submitted = 1
-          AND x.original_run_id IS NOT NULL
-          AND x.{date_column} >= %(start_date)s
-          AND x.{date_column} < DATEADD(day, 1, %(end_date)s)
-          AND (%(department_id)s IS NULL OR x.dept_id = %(department_id)s)
-          AND (x.dept_id IS NULL OR x.dept_id NOT IN ({_EXCLUDED_DEPT_SQL}))
-        """
-        try:
-            rows = _execute_parameterized(
-                query,
-                {"start_date": start_date, "end_date": end_date, "department_id": department_id},
-            )
-            return int(rows[0]["deleted_runs"]) if rows else 0
-        except Exception as e:
-            if date_column == "created":
-                raise
-            logger.warning(
-                f"claims_deleted.{date_column} query failed, falling back to 'created': {e}"
-            )
-    return 0
+    columns = {c.lower() for c in get_table_column_names("claims_deleted")}
+    date_column = "date_of_submitted" if "date_of_submitted" in columns else "created"
+    query = f"""
+    SELECT COUNT(DISTINCT x.id) AS deleted_runs
+    FROM dbo.claims_deleted x
+    WHERE x.submitted = 1
+      AND x.original_run_id IS NOT NULL
+      AND x.{date_column} >= %(start_date)s
+      AND x.{date_column} < DATEADD(day, 1, %(end_date)s)
+      AND (%(department_id)s IS NULL OR x.dept_id = %(department_id)s)
+      AND (x.dept_id IS NULL OR x.dept_id NOT IN ({_EXCLUDED_DEPT_SQL}))
+    """
+    rows = _execute_parameterized(
+        query,
+        {"start_date": start_date, "end_date": end_date, "department_id": department_id},
+    )
+    return int(rows[0]["deleted_runs"]) if rows else 0
 
 
 def get_claim_status_versions(

@@ -483,7 +483,10 @@ export const AiClaimComparisonDashboard: React.FC = () => {
           </span>
           <button
             type="button"
-            onClick={() => setSchemaOpen(true)}
+            onClick={() => {
+              setSchemaError(null);
+              setSchemaOpen(true);
+            }}
             style={{ background: 'none', border: '1px solid currentColor', borderRadius: '4px', padding: '4px 8px', color: 'inherit', cursor: 'pointer' }}
           >
             Open schema check
@@ -544,7 +547,14 @@ export const AiClaimComparisonDashboard: React.FC = () => {
       <SectionCard title="Data Quality & Schema Check">
         <button
           type="button"
-          onClick={() => setSchemaOpen((open) => !open)}
+          onClick={() => {
+            setSchemaOpen((open) => {
+              // Reopening after a failed fetch clears the error so the
+              // effect retries instead of staying stuck on the error state.
+              if (!open) setSchemaError(null);
+              return !open;
+            });
+          }}
           style={{
             display: 'flex',
             alignItems: 'center',

@@ -64,9 +64,10 @@ def cached(
                 else:
                     del _cache[key]
 
-            # Cache miss — compute
+            # Cache miss — compute. Expiry is measured from write time so a
+            # slow compute does not shave its own runtime off the TTL.
             result = await fn(*args, **kwargs)
-            _cache[key] = (now + ttl, result)
+            _cache[key] = (time.time() + ttl, result)
             logger.debug(f"AI analytics cache miss: {name} (cached for {ttl}s)")
             return result
 
@@ -75,6 +76,25 @@ def cached(
         return wrapper
 
     return decorator
+
+
+def prime_cache(
+    func_name: str,
+    args: tuple,
+    kwargs: dict,
+    value: Any,
+    ttl: int = _DEFAULT_TTL,
+) -> None:
+    """Store ``value`` under the same key the ``cached`` wrapper would use.
+
+    The background warmer refreshes entries unconditionally: a plain call
+    would hit the still-valid cached entry and never extend its expiry, so
+    the TTL would lapse between warm cycles. Expiry is measured from write
+    time.
+    """
+    if _is_testing():
+        return
+    _cache[_make_key(func_name, args, kwargs)] = (time.time() + ttl, value)
 
 
 def clear_cache() -> None:
