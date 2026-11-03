@@ -615,6 +615,29 @@ class TestCacheWarmer:
             assert len(calls) == 1
             cache_mod.clear_cache()
 
+    def test_cache_returns_incomplete_after_max_stale_age(self):
+        import time as time_mod
+        from ai_analytics import cache as cache_mod
+        calls = []
+
+        @cache_mod.cached(ttl=60, func_name="probe3")
+        async def probe3():
+            calls.append(1)
+            return SimpleNamespace(data_complete=False, n=len(calls))
+
+        with patch.object(cache_mod, "_is_testing", return_value=False):
+            cache_mod.clear_cache()
+            # Good value computed long ago, already past the max stale age
+            cache_mod.prime_cache(
+                "probe3", (), {}, "OLD", ttl=-1,
+                computed_at=time_mod.time() - cache_mod._MAX_STALE_AGE - 1,
+            )
+            result = asyncio.run(probe3())
+            # Fresh incomplete result surfaces the outage, not the stale value
+            assert result.data_complete is False
+            assert result.n == 1
+            cache_mod.clear_cache()
+
     def test_cache_does_not_store_incomplete_result(self):
         from ai_analytics import cache as cache_mod
         calls = []
@@ -633,13 +656,43 @@ class TestCacheWarmer:
             assert first.n == 1 and second.n == 2
             cache_mod.clear_cache()
 
+    def test_cached_retry_renewal_capped_at_stale_deadline(self):
+        import time as time_mod
+        from ai_analytics import cache as cache_mod
+        calls = []
+
+        @cache_mod.cached(ttl=60, func_name="probe4")
+        async def probe4():
+            calls.append(1)
+            return SimpleNamespace(data_complete=False, n=len(calls))
+
+        now = time_mod.time()
+        with patch.object(cache_mod, "_is_testing", return_value=False):
+            cache_mod.clear_cache()
+            # Good value 10s short of the max stale age, already expired
+            cache_mod.prime_cache(
+                "probe4", (), {}, "GOOD", ttl=-1,
+                computed_at=now - cache_mod._MAX_STALE_AGE + 10,
+            )
+            with patch.object(cache_mod.time, "time", return_value=now):
+                assert asyncio.run(probe4()) == "GOOD"
+                expires_at, _, _ = cache_mod._cache[list(cache_mod._cache)[0]]
+                # Retry renewal capped at the deadline, not the full 120s window
+                assert expires_at <= now + 10 + 1
+            # Past the deadline the request surfaces the incomplete result
+            with patch.object(cache_mod.time, "time", return_value=now + 11):
+                result = asyncio.run(probe4())
+                assert result.data_complete is False
+                assert result.n == 2
+            cache_mod.clear_cache()
+
     def test_touch_cache_extends_existing_entry(self):
         from ai_analytics import cache as cache_mod
         with patch.object(cache_mod, "_is_testing", return_value=False):
             cache_mod.clear_cache()
             cache_mod.prime_cache("probe", (1,), {}, "GOOD", ttl=-1)
             assert cache_mod.touch_cache("probe", (1,), {}, ttl=3600) is True
-            expires_at, value = cache_mod._cache[list(cache_mod._cache)[0]]
+            expires_at, value, _ = cache_mod._cache[list(cache_mod._cache)[0]]
             assert value == "GOOD"
             assert expires_at > 0
             assert cache_mod.touch_cache("missing", (1,), {}, ttl=60) is False
@@ -647,6 +700,20 @@ class TestCacheWarmer:
             # requests retry the source.
             cache_mod.prime_cache("bad", (), {}, SimpleNamespace(data_complete=False), ttl=60)
             assert cache_mod.touch_cache("bad", (), {}, ttl=3600) is False
+            # A complete value older than the max stale age is not renewed
+            import time as time_mod
+            cache_mod.prime_cache(
+                "old", (), {}, "OLD", ttl=-1,
+                computed_at=time_mod.time() - cache_mod._MAX_STALE_AGE - 1,
+            )
+            assert cache_mod.touch_cache("old", (), {}, ttl=3600) is False
+            # Near the deadline, a renewal is capped at it — stale totals can
+            # never outlive the max age via touches or retry renewals.
+            deadline = time_mod.time() - cache_mod._MAX_STALE_AGE + 30
+            cache_mod.prime_cache("edge", (), {}, "OK", ttl=-1, computed_at=deadline)
+            assert cache_mod.touch_cache("edge", (), {}, ttl=3600) is True
+            expires_at, _, _ = cache_mod._cache[list(cache_mod._cache)[-1]]
+            assert expires_at <= deadline + cache_mod._MAX_STALE_AGE + 1
             cache_mod.clear_cache()
 
     def test_status_versions_bound_rows_before_grouping(self):
