@@ -145,7 +145,7 @@ def _effective_state(
     """
     best: Optional[Tuple[str, datetime]] = None
     best_key: Optional[Tuple[datetime, bool]] = None
-    for _status, bucket, row_start, is_current in versions:
+    for _status, bucket, row_start, is_current, _first_start in versions:
         if bucket == BUCKET_ARCHIVE:
             continue
         if as_of is not None and row_start >= as_of:
@@ -161,14 +161,16 @@ def _fetch_status_versions(
     claim_ids: List[int],
     row_start_column: str,
     as_of: Optional[datetime] = None,
-) -> Tuple[Dict[int, List[Tuple[str, str, datetime, bool]]], Counter]:
-    """(status, bucket, row_start, is_current) versions per claim, plus unmapped status counts.
+) -> Tuple[Dict[int, List[Tuple[str, str, datetime, bool, datetime]]], Counter]:
+    """(status, bucket, last_start, is_current, first_start) versions per claim,
+    plus unmapped status counts.
 
     ``row_start`` values are UTC (the temporal AS_ROW_START column). Unmapped
     raw statuses are only counted for versions before ``as_of`` so a past
-    window never reports post-window values.
+    window never reports post-window values. ``first_start`` is the earliest
+    occurrence of that status — used to date when a claim entered the process.
     """
-    versions: Dict[int, List[Tuple[str, str, datetime, bool]]] = defaultdict(list)
+    versions: Dict[int, List[Tuple[str, str, datetime, bool, datetime]]] = defaultdict(list)
     unmapped: Counter = Counter()
     chunks = list(_chunks(claim_ids, HISTORY_CHUNK_SIZE))
     for i, chunk in enumerate(chunks):
@@ -178,6 +180,7 @@ def _fetch_status_versions(
             if claim_id is None or not last_start:
                 continue
             last_start_dt = _parse_ts(last_start)
+            first_start_dt = _parse_ts(row.get("first_start") or last_start)
             status = row.get("status")
             if not is_mapped_claim_status(status):
                 if as_of is None or last_start_dt < as_of:
@@ -187,12 +190,43 @@ def _fetch_status_versions(
                 classify_claim_status(status),
                 last_start_dt,
                 bool(row.get("is_current")),
+                first_start_dt,
             ))
         # Pace chunk reads so a full history scan can't starve the shared
         # Azure SQL (other dashboards' queries interleave between chunks).
         if i < len(chunks) - 1:
             time.sleep(_chunk_delay_seconds())
     return versions, unmapped
+
+
+def _process_entry_local_date(
+    record: Optional[Dict[str, Any]],
+    claim_versions: List[Tuple[str, str, datetime, bool, datetime]],
+    local_offset: timedelta,
+) -> Optional[date]:
+    """Local date the claim entered the line-item process.
+
+    AI claims: ``business_status_date`` from the Mongo record (``ai_inserted_at``
+    — when the run entered AI line-item processing). Everything else: the
+    initial assignment — the earliest 'Assigned' status first_start, falling
+    back to the earliest version start overall. Returns None when nothing
+    marks an entry into the process.
+    """
+    if record and record.get("business_status_date"):
+        try:
+            return date.fromisoformat(str(record["business_status_date"])[:10])
+        except ValueError:
+            pass
+    if not claim_versions:
+        return None
+    assigned = [
+        fs for status, _b, _ls, _cur, fs in claim_versions
+        if status and status.strip().lower() == "assigned"
+    ]
+    earliest = min(assigned) if assigned else min(
+        fs for _s, _b, _ls, _cur, fs in claim_versions
+    )
+    return (earliest + local_offset).date()
 
 
 class _ClaimOutcome:
@@ -406,6 +440,9 @@ async def _compute_claim_payment_comparison(
             filters.start_date,
             filters.end_date,
             filters.department_id,
+            row_start_column,
+            datetime(start.year, start.month, start.day)
+            - timedelta(hours=settings.AI_LOCAL_UTC_OFFSET_HOURS),
         )
     except Exception as e:
         logger.error(f"Claim comparison SQL scope query failed: {e}")
@@ -431,29 +468,24 @@ async def _compute_claim_payment_comparison(
         return _empty_result(start, end, source_status)
     ai_by_claim = {int(r["claim_id"]): r for r in records if r.get("claim_id")}
 
-    tracked: List[Tuple[int, str, Optional[str], Optional[Dict[str, Any]], Dict[str, Any]]] = []
-    ai_pending = 0
-    for row in scope_rows:
-        if row.get("id") is None:
-            continue
-        claim_id = int(row["id"])
-        record = ai_by_claim.get(claim_id)
-        cohort, subtype = _cohort_for(record)
-        if cohort == COHORT_AI_PENDING:
-            ai_pending += 1
-            continue
-        tracked.append((claim_id, cohort, subtype, record, row))
+    # Candidates = SQL scope rows ∪ AI-cohort claims. An AI-processed claim
+    # qualifies on its ai_inserted_at alone — submission date is irrelevant.
+    scope_by_claim: Dict[int, Dict[str, Any]] = {
+        int(row["id"]): row for row in scope_rows if row.get("id") is not None
+    }
+    candidate_ids = set(scope_by_claim) | set(ai_by_claim)
 
     # Cap everything at the end of the local window (inclusive dates).
     # Row starts are UTC, so the local end-of-window is converted to UTC the
     # same way _utc_window_for_local_dates does: UTC = local - offset.
     as_of_local = datetime(end.year, end.month, end.day) + timedelta(days=1)
-    as_of = as_of_local - timedelta(hours=settings.AI_LOCAL_UTC_OFFSET_HOURS)
+    local_offset = timedelta(hours=settings.AI_LOCAL_UTC_OFFSET_HOURS)
+    as_of = as_of_local - local_offset
 
     try:
         versions, unmapped = await asyncio.to_thread(
             _fetch_status_versions,
-            [t[0] for t in tracked],
+            sorted(candidate_ids),
             row_start_column,
             as_of,
         )
@@ -461,6 +493,25 @@ async def _compute_claim_payment_comparison(
         logger.error(f"Claim comparison status history query failed: {e}")
         source_status["recoveryhub_sql"] = "unavailable"
         return _empty_result(start, end, source_status)
+
+    # Payload gate: a claim only counts if it entered the process inside the
+    # window — AI claims by their ai_inserted_at (line-item creation date),
+    # the rest by their initial assignment date (earliest 'Assigned' version,
+    # falling back to the earliest version overall). date_of_submitted does
+    # not gate anything.
+    tracked: List[Tuple[int, str, Optional[str], Optional[Dict[str, Any]], Dict[str, Any]]] = []
+    ai_pending = 0
+    for claim_id in sorted(candidate_ids):
+        row = scope_by_claim.get(claim_id, {"id": claim_id, "type_id": None, "type_name": None})
+        record = ai_by_claim.get(claim_id)
+        entry = _process_entry_local_date(record, versions.get(claim_id, []), local_offset)
+        if entry is None or entry < start or entry > end:
+            continue
+        cohort, subtype = _cohort_for(record)
+        if cohort == COHORT_AI_PENDING:
+            ai_pending += 1
+            continue
+        tracked.append((claim_id, cohort, subtype, record, row))
 
     deleted_runs = 0
     try:
@@ -490,13 +541,13 @@ async def _compute_claim_payment_comparison(
             effective_date=effective[1] if effective else None,
             ever_not_billable=any(
                 b == BUCKET_NOT_BILLABLE
-                for _, b, row_start, _ in claim_versions
+                for _, b, row_start, _, _fs in claim_versions
                 if row_start < as_of
             ),
             incident=incident_type_label(row.get("type_id"), row.get("type_name")),
             billing_target=billing_target_from_statuses(
                 (status, last_start, is_current)
-                for status, _, last_start, is_current in claim_versions
+                for status, _, last_start, is_current, _fs in claim_versions
                 if last_start < as_of
             ),
             system_not_billable=bool(system_not_billable),
