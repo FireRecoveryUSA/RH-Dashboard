@@ -99,9 +99,9 @@ def _parse_ts(value: Any) -> datetime:
 
 
 def resolve_comparison_window(end_date: Optional[str]) -> Tuple[str, str]:
-    """Fixed window: Jan 1 of the SQL server's year through ``end_date`` (default today)."""
+    """Fixed window: Jul 1 of the SQL server's year through ``end_date`` (default today)."""
     today = date.fromisoformat(sql_repo.get_server_date())
-    start = date(today.year, 1, 1)
+    start = date(today.year, 7, 1)
     return start.isoformat(), end_date or today.isoformat()
 
 

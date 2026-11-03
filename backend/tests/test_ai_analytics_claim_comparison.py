@@ -941,14 +941,14 @@ class TestClaimComparisonRoute:
                 p.stop()
         assert response.status_code == 200
         data = response.json()
-        assert data["period_start"] == "2026-01-01"
+        assert data["period_start"] == "2026-07-01"
         assert data["period_end"] == "2026-08-13"
         for key in ("overall", "ai_released", "other", "other_manual", "other_ai_rejected",
                     "weekly", "by_incident_type", "by_billing_target", "not_billable",
                     "unmapped_statuses", "resolved_columns", "source_status", "data_complete"):
             assert key in data
         assert data["not_billable"]["marked_by_processor"] == 0
-        assert data["weekly"][0]["week"] == "2026-W01"
+        assert data["weekly"][0]["week"] == "2026-W27"
 
     def test_claim_comparison_requires_auth(self, test_client):
         response = test_client.get("/api/ai-analytics/claim-comparison")
