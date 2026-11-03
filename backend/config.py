@@ -228,6 +228,19 @@ class Settings:
         os.getenv("AI_ANALYTICS_USE_PROJECTION", "false").lower() == "true"
     )
 
+    # Offset (hours) between the organization's local civil dates and UTC.
+    # The AI-side Mongo timestamps (ai_line_items.inserted_at etc.) are UTC,
+    # but dashboard date ranges are org-local dates (matching the SQL
+    # date_of_submitted convention, which stores local wall-clock time).
+    # Verified production offset is a constant -7 (US Mountain Standard,
+    # no DST). Used to convert a local date window [D, D+1) into the UTC
+    # window [D - offset, D+1 - offset) when date-filtering the projection
+    # cohort, so a run submitted 8 PM local lands on the local date the
+    # user expects rather than the next UTC day.
+    AI_LOCAL_UTC_OFFSET_HOURS: float = float(
+        os.getenv("AI_LOCAL_UTC_OFFSET_HOURS", "-7")
+    )
+
     def validate_settings(self) -> None:
         """Validates configuration parameters, stopping startup if required variables are missing."""
         missing = []

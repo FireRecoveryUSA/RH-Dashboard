@@ -220,6 +220,53 @@ class TestEffectiveStatus:
         assert resp.overall.total == 0
         assert resp.unresolved_claims == 1
 
+    def test_versions_after_end_date_are_ignored(self):
+        rows = _versions(
+            1,
+            ("Under Review", "2026-02-01T10:00:00"),
+            ("Payment Received", "2026-07-15T10:00:00"),
+        )
+        resp = _run([_scope_row(1)], rows)
+        assert resp.overall.under_review == 1
+        assert resp.overall.paid == 0
+        assert all(w.other_manual.paid == 0 for w in resp.weekly)
+
+    def test_all_versions_after_end_date_is_unresolved(self):
+        rows = _versions(1, ("Payment Received", "2026-07-15T10:00:00"))
+        resp = _run([_scope_row(1)], rows)
+        assert resp.overall.total == 0
+        assert resp.unresolved_claims == 1
+
+    def test_future_billing_statuses_do_not_set_target(self):
+        rows = _versions(
+            1,
+            ("Under Review", "2026-02-01T10:00:00"),
+            ("Invoiced Insurance", "2026-07-15T10:00:00"),
+        )
+        resp = _run([_scope_row(1)], rows)
+        labels = {s.label: s for s in resp.by_billing_target}
+        assert labels["Unknown"].overall.total == 1
+        assert "Insurance" not in labels
+
+    def test_not_billable_after_end_date_is_ignored(self):
+        rows = _versions(
+            1,
+            ("Payment Received", "2026-02-01T10:00:00"),
+            ("Unbillable", "2026-07-15T10:00:00"),
+        )
+        resp = _run([_scope_row(1)], rows)
+        assert resp.not_billable.marked_by_processor == 0
+        assert resp.not_billable.other.ever_not_billable == 0
+
+    def test_unmapped_status_after_end_date_is_not_reported(self):
+        rows = _versions(
+            1,
+            ("Payment Received", "2026-02-01T10:00:00"),
+            ("Mystery Stage", "2026-07-15T10:00:00"),
+        )
+        resp = _run([_scope_row(1)], rows)
+        assert resp.unmapped_statuses == {}
+
 
 class TestEffectiveStatusTies:
     @pytest.mark.parametrize("reverse", [False, True])
@@ -446,6 +493,48 @@ class TestChunkingAndSql:
         resp = _run([_scope_row(1)], [], ai_complete=False)
         assert resp.data_complete is False
 
+    def test_ai_mongo_unavailable_returns_incomplete_empty_result(self):
+        with patch(f"{SQL}.get_claims_row_start_column", return_value=ROW_START), \
+             patch(f"{SQL}.get_claim_comparison_scope",
+                   return_value=[_scope_row(1)]), \
+             patch(f"{SERVICE}._load_normalized_cohort", new_callable=AsyncMock,
+                   return_value=(
+                       [],
+                       {"recoveryhub_sql": "available",
+                        "recoveryhub_ai_mongo": "unavailable"},
+                       False,
+                   )):
+            resp = asyncio.run(svc.get_claim_payment_comparison(None, _filters()))
+        assert resp.data_complete is False
+        assert resp.source_status["recoveryhub_ai_mongo"] == "unavailable"
+        # No cohort data must not misclassify every run as manual.
+        assert resp.other_manual.total == 0
+        assert resp.overall.total == 0
+
+    def test_deleted_runs_filters_date_of_submitted_when_present(self):
+        with patch(f"{SQL}.get_table_column_names",
+                   return_value=["id", "date_of_submitted", "created"]), \
+             patch(f"{SQL}._execute_parameterized",
+                   return_value=[{"deleted_runs": 4}]) as execute:
+            assert sql_repo.get_deleted_runs_count("2026-01-01", "2026-06-30", None) == 4
+        assert "x.date_of_submitted" in execute.call_args[0][0]
+
+    def test_deleted_runs_falls_back_to_created_column(self):
+        with patch(f"{SQL}.get_table_column_names",
+                   return_value=["id", "created", "dept_id"]), \
+             patch(f"{SQL}._execute_parameterized",
+                   return_value=[{"deleted_runs": 4}]) as execute:
+            assert sql_repo.get_deleted_runs_count("2026-01-01", "2026-06-30", None) == 4
+        assert "x.created" in execute.call_args[0][0]
+
+    def test_deleted_runs_query_error_propagates(self):
+        with patch(f"{SQL}.get_table_column_names",
+                   return_value=["id", "date_of_submitted"]), \
+             patch(f"{SQL}._execute_parameterized",
+                   side_effect=RuntimeError("timeout")):
+            with pytest.raises(RuntimeError):
+                sql_repo.get_deleted_runs_count("2026-01-01", "2026-06-30", None)
+
     def test_deleted_query_failure_marks_partial(self):
         with patch(f"{SQL}.get_claims_row_start_column", return_value=ROW_START), \
              patch(f"{SQL}.get_claim_comparison_scope", return_value=[]), \
@@ -456,6 +545,41 @@ class TestChunkingAndSql:
             resp = asyncio.run(svc.get_claim_payment_comparison(None, _filters()))
         assert resp.data_complete is False
         assert resp.source_status["recoveryhub_sql"] == "partial"
+
+
+# ---------------------------------------------------------------------------
+# Cache warmer
+# ---------------------------------------------------------------------------
+
+class TestCacheWarmer:
+    def test_warm_interval_defaults_to_600(self, monkeypatch):
+        monkeypatch.delenv("CLAIM_COMPARISON_WARM_INTERVAL_SECONDS", raising=False)
+        assert svc._warm_interval_seconds() == 600
+
+    def test_warm_interval_invalid_value_falls_back(self, monkeypatch):
+        monkeypatch.setenv("CLAIM_COMPARISON_WARM_INTERVAL_SECONDS", "bogus")
+        assert svc._warm_interval_seconds() == 600
+
+    def test_warm_interval_zero_disables_warmer(self, monkeypatch):
+        monkeypatch.setenv("CLAIM_COMPARISON_WARM_INTERVAL_SECONDS", "0")
+        assert asyncio.run(svc.warm_claim_comparison_cache(None)) is None
+
+    def test_warm_once_recomputes_and_primes_cache(self):
+        fake_db = object()
+        with patch(f"{SERVICE}.resolve_comparison_window",
+                   return_value=("2026-01-01", "2026-06-30")), \
+             patch(f"{SERVICE}._compute_claim_payment_comparison",
+                   new_callable=AsyncMock, return_value="RESULT") as compute, \
+             patch(f"{SERVICE}.prime_cache") as prime:
+            asyncio.run(svc._warm_once(fake_db))
+        compute.assert_awaited_once()
+        prime.assert_called_once()
+        func_name, args, kwargs, value, ttl = prime.call_args[0]
+        assert func_name == "get_claim_payment_comparison"
+        assert args[0] is fake_db
+        assert kwargs == {}
+        assert value == "RESULT"
+        assert ttl == svc.CACHE_TTL_SECONDS
 
 
 # ---------------------------------------------------------------------------

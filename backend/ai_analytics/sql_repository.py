@@ -199,6 +199,60 @@ def get_ai_invoice_record_for_claim(claim_id: int) -> Optional[Dict[str, Any]]:
         raise
 
 
+CLAIM_LIFECYCLE_SQL = """
+SELECT
+    c.id,
+    c.ClaimCurrentTypeId,
+    c.status,
+    c.archived
+FROM dbo.Claims c
+WHERE c.id IN (
+    -- CAST is required: for large claim batches pyodbc sends the CSV param
+    -- as ntext, which STRING_SPLIT rejects ("Argument data type ntext is
+    -- invalid for argument 1"). Without the cast the query fails and the
+    -- caller silently gets no lifecycle data.
+    SELECT value FROM STRING_SPLIT(CAST(%(claim_ids_csv)s AS nvarchar(max)), ',')
+)
+"""
+
+
+def get_claim_lifecycle_for_claims(
+    claim_ids: List[int],
+) -> Dict[int, Dict[str, Any]]:
+    """Fetch the run-lifecycle fields for a batch of claims.
+
+    This is the run record — the same source the Claims Breakdown buckets
+    use — so the AI dashboard's "New runs / Active runs" stages reconcile
+    exactly with those widgets:
+    - ``ClaimCurrentTypeId`` 1 = New Run, 4 = Active Run.
+    - ``status`` is the RH claim status (e.g. 'Unassigned' while the AI
+      works, 'Payment Received' / 'Denied' / 'Confirm the Receipt of
+      Invoice' after release).
+
+    Returns a dict keyed by claim_id →
+    ``{"type_id": int|None, "status": str|None, "archived": int|None}``.
+    Claims missing from Claims are absent from the dict.
+    """
+    csv = ",".join(str(int(cid)) for cid in claim_ids)
+    try:
+        rows = _execute_parameterized(CLAIM_LIFECYCLE_SQL, {"claim_ids_csv": csv})
+    except TargetDatabaseError as e:
+        logger.error(f"Failed to fetch claim lifecycle: {e}")
+        raise
+    by_claim: Dict[int, Dict[str, Any]] = {}
+    for row in rows:
+        try:
+            cid = int(row["id"])
+        except (ValueError, TypeError):
+            continue
+        by_claim[cid] = {
+            "type_id": row.get("ClaimCurrentTypeId"),
+            "status": row.get("status"),
+            "archived": row.get("archived"),
+        }
+    return by_claim
+
+
 # ---------------------------------------------------------------------------
 # Cancellation details
 # ---------------------------------------------------------------------------
@@ -538,6 +592,7 @@ def get_claims_row_start_column() -> str:
     FROM sys.tables t
     INNER JOIN sys.columns c ON c.object_id = t.object_id
     WHERE t.name = 'Claims'
+      AND SCHEMA_NAME(t.schema_id) = 'dbo'
       AND c.generated_always_type_desc = 'AS_ROW_START'
     """
     rows = _execute_raw_sql(query)
@@ -616,18 +671,23 @@ def get_deleted_runs_count(
     end_date: str,
     department_id: Optional[int],
 ) -> int:
-    """Deleted runs created in the window (dbo.claims_deleted), excluding Rural Metro.
+    """Deleted runs submitted in the window (dbo.claims_deleted), excluding Rural Metro.
 
-    ``dept_id`` on claims_deleted is not verified against production; the
-    schema-check endpoint reports the table's columns.
+    Filters ``date_of_submitted`` to match the live scope query, so a run
+    created last year and submitted this year is still counted. Uses
+    ``created`` when claims_deleted lacks that column — the column is chosen
+    once up front from the table's metadata, so a transient query failure can
+    never silently swap the metric's date semantics.
     """
+    columns = {c.lower() for c in get_table_column_names("claims_deleted")}
+    date_column = "date_of_submitted" if "date_of_submitted" in columns else "created"
     query = f"""
     SELECT COUNT(DISTINCT x.id) AS deleted_runs
     FROM dbo.claims_deleted x
     WHERE x.submitted = 1
       AND x.original_run_id IS NOT NULL
-      AND x.created >= %(start_date)s
-      AND x.created < DATEADD(day, 1, %(end_date)s)
+      AND x.{date_column} >= %(start_date)s
+      AND x.{date_column} < DATEADD(day, 1, %(end_date)s)
       AND (%(department_id)s IS NULL OR x.dept_id = %(department_id)s)
       AND (x.dept_id IS NULL OR x.dept_id NOT IN ({_EXCLUDED_DEPT_SQL}))
     """

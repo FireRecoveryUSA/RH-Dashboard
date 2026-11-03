@@ -1,0 +1,6 @@
+- generic [ref=e4]:
+  - generic [ref=e5]:
+    - heading "RecoveryHub Portal" [level=1] [ref=e11]
+    - paragraph [ref=e12]: Monitor emergency fire run logs, track claim statuses, and view invoicing flows across departments.
+  - button "Sign In with Microsoft" [ref=e13] [cursor=pointer]
+  - generic [ref=e17]: Requires corporate login credentials matching your organization's streamlineas.com domain directory.

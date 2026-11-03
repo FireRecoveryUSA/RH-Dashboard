@@ -5,6 +5,7 @@ All endpoints are read-only and require authentication via ``get_current_user``.
 
 from __future__ import annotations
 
+import asyncio
 import functools
 import logging
 from typing import Any, Callable, List, Optional
@@ -175,7 +176,7 @@ _Q_SORT_BY = Query("ai_business_updated_at", description="Sort column")
 _Q_SORT_DIRECTION = Query("desc", description="Sort direction: asc | desc")
 _Q_DATE_BASIS = Query(
     "business_status_date",
-    description="Date basis: business_status_date | claim_created_date | ai_record_updated_date",
+    description="Date basis: business_status_date | claim_created_date | ai_record_inserted_date | ai_record_updated_date (all resolve to the AI record's submitted-to-us timestamp except the last, which uses the AI record's last update)",
 )
 
 
@@ -575,7 +576,9 @@ async def claim_payment_comparison(
     ai_db=Depends(get_ai_db),
 ):
     """Final payment outcome of AI-released vs other runs, year to date."""
-    start_date, resolved_end = resolve_comparison_window(end_date)
+    start_date, resolved_end = await asyncio.to_thread(
+        resolve_comparison_window, end_date
+    )
     filters = AiAnalyticsFilters(
         start_date=start_date,
         end_date=resolved_end,
@@ -594,7 +597,9 @@ async def claim_comparison_schema_check(
     end_date: Optional[str] = _Q_END_DATE,
 ):
     """Raw status, billing-mode and incident-column values behind the config."""
-    start_date, resolved_end = resolve_comparison_window(end_date)
+    start_date, resolved_end = await asyncio.to_thread(
+        resolve_comparison_window, end_date
+    )
     return await get_claim_comparison_schema_check(start_date, resolved_end)
 
 

@@ -205,3 +205,43 @@ def test_client():
     from fastapi.testclient import TestClient
     from main import app
     return TestClient(app)
+
+
+def make_projection_doc(claim_id, sql_row=None, ai_record=None, **extra):
+    """Build an ``ai_invoice_analytics`` projection doc from old fixture shapes.
+
+    The outcomes cohort is Mongo-first: tests that used to patch the SQL
+    cohort + direct Mongo read now seed projection docs instead. This
+    helper merges the two old fixture shapes (SQL row + ai_record) into
+    the projection field names (Phase 0 plan Section 9) so existing test
+    data translates mechanically.
+    """
+    sql_row = sql_row or {}
+    ai_record = ai_record or {}
+    doc = {
+        "_id": claim_id,
+        "claim_id": claim_id,
+        "department_id": sql_row.get("dept_id"),
+        "department_name": sql_row.get("department_name"),
+        "run_number": sql_row.get("run_number"),
+        "ai_inserted_at": sql_row.get("ai_business_updated_at"),
+        "ai_updated_at": sql_row.get("ai_business_updated_at"),
+        "has_ai_line_item_record": True,
+        "ai_processing_status": ai_record.get("claim_processing_status"),
+        "agent_execution_status": ai_record.get("agent_exec_status"),
+        "ai_invoice_total": ai_record.get("invoice_total"),
+        "processing_duration_seconds": ai_record.get("processing_time_seconds"),
+        "confidence_level": ai_record.get("confidence_level"),
+        "is_billable": ai_record.get("is_billable"),
+        "billing_category": ai_record.get("billing_category"),
+        "billing_level": ai_record.get("billing_level"),
+        "level_identification_confidence": ai_record.get("level_identification_confidence"),
+        "level_identification_low_confidence": ai_record.get("level_identification_low_confidence"),
+        "dept_send_auto_invoice_status": ai_record.get("dept_send_auto_invoice_status"),
+        "is_cancelled": ai_record.get("is_cancelled"),
+        "cancellation_reason": ai_record.get("cancellation_reason"),
+        "line_items_save_to_rh_status": ai_record.get("line_items_save_to_rh_status"),
+        "retry_count": ai_record.get("retry_count"),
+    }
+    doc.update(extra)
+    return doc
