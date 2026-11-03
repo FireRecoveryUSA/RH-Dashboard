@@ -590,9 +590,40 @@ class TestCacheWarmer:
              patch(f"{SERVICE}._compute_claim_payment_comparison",
                    new_callable=AsyncMock,
                    return_value=SimpleNamespace(data_complete=False)), \
+             patch(f"{SERVICE}.touch_cache", return_value=True) as touch, \
              patch(f"{SERVICE}.prime_cache") as prime:
             asyncio.run(svc._warm_once(fake_db))
         prime.assert_not_called()
+        touch.assert_called_once()
+
+    def test_cache_serves_stale_over_incomplete_recompute(self):
+        from ai_analytics import cache as cache_mod
+        calls = []
+
+        @cache_mod.cached(ttl=60, func_name="probe")
+        async def probe():
+            calls.append(1)
+            return SimpleNamespace(data_complete=False, n=len(calls))
+
+        with patch.object(cache_mod, "_is_testing", return_value=False):
+            cache_mod.clear_cache()
+            cache_mod.prime_cache("probe", (), {}, "GOOD", ttl=-1)  # already expired
+            # Expired entry + incomplete recompute -> stale value served, entry kept
+            assert asyncio.run(probe()) == "GOOD"
+            assert asyncio.run(probe()) == "GOOD"
+            cache_mod.clear_cache()
+
+    def test_touch_cache_extends_existing_entry(self):
+        from ai_analytics import cache as cache_mod
+        with patch.object(cache_mod, "_is_testing", return_value=False):
+            cache_mod.clear_cache()
+            cache_mod.prime_cache("probe", (1,), {}, "GOOD", ttl=-1)
+            assert cache_mod.touch_cache("probe", (1,), {}, ttl=3600) is True
+            expires_at, value = cache_mod._cache[list(cache_mod._cache)[0]]
+            assert value == "GOOD"
+            assert expires_at > 0
+            assert cache_mod.touch_cache("missing", (1,), {}, ttl=60) is False
+            cache_mod.clear_cache()
 
     def test_status_versions_bound_rows_before_grouping(self):
         from datetime import datetime as dt

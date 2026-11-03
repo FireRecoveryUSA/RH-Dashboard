@@ -63,7 +63,7 @@ from .claim_status_config import (
     incident_type_label,
     is_mapped_claim_status,
 )
-from .cache import cached, prime_cache
+from .cache import cached, prime_cache, touch_cache
 
 logger = logging.getLogger(__name__)
 
@@ -528,11 +528,22 @@ async def _warm_once(ai_db) -> None:
     value = await _compute_claim_payment_comparison(ai_db, filters)
     if not value.data_complete:
         # Don't overwrite the last good entry with an empty result from a
-        # transient outage — requests would see an empty dashboard until the
-        # next successful warm. Keep the stale entry (or none) instead.
-        logger.warning(
-            "Claim comparison warm produced an incomplete result; keeping previous cache entry"
-        )
+        # transient outage — and extend its expiry so requests keep being
+        # served from cache instead of triggering a cold history read that
+        # would exceed the proxy timeout before the next warm runs.
+        if touch_cache(
+            "get_claim_payment_comparison",
+            (ai_db, filters),
+            {},
+            CACHE_TTL_SECONDS,
+        ):
+            logger.warning(
+                "Claim comparison warm produced an incomplete result; extended previous cache entry"
+            )
+        else:
+            logger.warning(
+                "Claim comparison warm produced an incomplete result; no cache entry to keep"
+            )
         return
     prime_cache(
         "get_claim_payment_comparison",

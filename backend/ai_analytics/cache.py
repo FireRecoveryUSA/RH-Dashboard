@@ -52,21 +52,26 @@ def cached(
                 return await fn(*args, **kwargs)
 
             key = _make_key(name, args, kwargs)
-            now = time.time()
 
-            # Check cache
             entry = _cache.get(key)
             if entry is not None:
                 expires_at, value = entry
-                if now < expires_at:
+                if time.time() < expires_at:
                     logger.debug(f"AI analytics cache hit: {name}")
                     return value
-                else:
-                    del _cache[key]
 
-            # Cache miss — compute. Expiry is measured from write time so a
-            # slow compute does not shave its own runtime off the TTL.
+            # Miss or expired — compute. Expiry is measured from write time so
+            # a slow compute does not shave its own runtime off the TTL. An
+            # expired entry is retained until a cacheable result replaces it:
+            # a transient outage's incomplete result must not overwrite the
+            # last good value (the claim-comparison warmer does the same via
+            # touch_cache).
             result = await fn(*args, **kwargs)
+            if entry is not None and getattr(result, "data_complete", True) is False:
+                logger.warning(
+                    f"AI analytics cache: keeping stale {name} entry over incomplete result"
+                )
+                return entry[1]
             _cache[key] = (time.time() + ttl, result)
             logger.debug(f"AI analytics cache miss: {name} (cached for {ttl}s)")
             return result
@@ -95,6 +100,26 @@ def prime_cache(
     if _is_testing():
         return
     _cache[_make_key(func_name, args, kwargs)] = (time.time() + ttl, value)
+
+
+def touch_cache(
+    func_name: str,
+    args: tuple,
+    kwargs: dict,
+    ttl: int = _DEFAULT_TTL,
+) -> bool:
+    """Extend an existing entry's expiry without changing its value.
+
+    Used by the warmer after a failed refresh: the last good value stays
+    servable until a successful warm (or a request) produces a complete
+    replacement. Returns False when there is no entry to extend.
+    """
+    key = _make_key(func_name, args, kwargs)
+    entry = _cache.get(key)
+    if entry is None:
+        return False
+    _cache[key] = (time.time() + ttl, entry[1])
+    return True
 
 
 def clear_cache() -> None:
