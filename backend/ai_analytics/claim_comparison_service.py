@@ -27,7 +27,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import socket
 import time
+import uuid
 from collections import Counter, defaultdict
 from datetime import date, datetime, timedelta
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
@@ -49,6 +51,7 @@ from . import sql_repository as sql_repo
 from .outcome_service import _load_normalized_cohort, iso_week_key
 from config import settings
 from .normalization_core import classify_billability
+from ai_analytics_worker.leader_election import release_lease, try_acquire_lease
 from .claim_status_config import (
     BUCKET_ARCHIVE,
     BUCKET_DENIED,
@@ -527,6 +530,18 @@ def _warm_interval_seconds() -> int:
         return 1800
 
 
+# Mongo lease serializing warm scans across uvicorn workers: each process
+# runs its own warmer (its in-memory cache needs priming too), but the
+# lease lets only one process run the heavy history scan at a time.
+WARM_RUN_LOCK_ID = "comparison_warm_run"
+# Long enough to cover the worst-case warm (~230 s); if the holder dies the
+# lease lapses and a peer resumes scanning instead of stalling forever.
+_WARM_RUN_LEASE_SECONDS = 900
+_WARM_HOLDER_ID = (
+    f"{socket.gethostname()}:{os.getpid()}:warm:{uuid.uuid4().hex[:8]}"
+)
+
+
 async def _warm_once(ai_db) -> None:
     """Recompute the default window and overwrite its cache entry.
 
@@ -534,6 +549,20 @@ async def _warm_once(ai_db) -> None:
     entry and never extend its expiry, leaving a cold-recompute window where
     the ~230 s history read exceeds the 180 s proxy timeout.
     """
+    if not await try_acquire_lease(
+        ai_db, WARM_RUN_LOCK_ID, _WARM_HOLDER_ID, _WARM_RUN_LEASE_SECONDS
+    ):
+        logger.info(
+            "Claim comparison warm deferred; another worker is scanning"
+        )
+        return
+    try:
+        await _warm_once_uncached(ai_db)
+    finally:
+        await release_lease(ai_db, WARM_RUN_LOCK_ID, _WARM_HOLDER_ID)
+
+
+async def _warm_once_uncached(ai_db) -> None:
     start, end = await asyncio.to_thread(resolve_comparison_window, None)
     filters = AiAnalyticsFilters(
         start_date=start,

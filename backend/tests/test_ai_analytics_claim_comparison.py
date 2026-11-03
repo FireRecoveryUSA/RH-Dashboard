@@ -599,7 +599,10 @@ class TestCacheWarmer:
     def test_warm_once_recomputes_and_primes_cache(self):
         fake_db = object()
         result = SimpleNamespace(data_complete=True)
-        with patch(f"{SERVICE}.resolve_comparison_window",
+        with patch(f"{SERVICE}.try_acquire_lease",
+                   new_callable=AsyncMock, return_value=True), \
+             patch(f"{SERVICE}.release_lease", new_callable=AsyncMock), \
+             patch(f"{SERVICE}.resolve_comparison_window",
                    return_value=("2026-01-01", "2026-06-30")), \
              patch(f"{SERVICE}._compute_claim_payment_comparison",
                    new_callable=AsyncMock, return_value=result) as compute, \
@@ -616,7 +619,10 @@ class TestCacheWarmer:
 
     def test_warm_once_keeps_previous_cache_on_incomplete_result(self):
         fake_db = object()
-        with patch(f"{SERVICE}.resolve_comparison_window",
+        with patch(f"{SERVICE}.try_acquire_lease",
+                   new_callable=AsyncMock, return_value=True), \
+             patch(f"{SERVICE}.release_lease", new_callable=AsyncMock), \
+             patch(f"{SERVICE}.resolve_comparison_window",
                    return_value=("2026-01-01", "2026-06-30")), \
              patch(f"{SERVICE}._compute_claim_payment_comparison",
                    new_callable=AsyncMock,
@@ -626,6 +632,31 @@ class TestCacheWarmer:
             asyncio.run(svc._warm_once(fake_db))
         prime.assert_not_called()
         touch.assert_called_once()
+
+    def test_warm_once_skips_when_another_worker_holds_lease(self):
+        fake_db = object()
+        with patch(f"{SERVICE}.try_acquire_lease",
+                   new_callable=AsyncMock, return_value=False) as acquire, \
+             patch(f"{SERVICE}._compute_claim_payment_comparison",
+                   new_callable=AsyncMock) as compute:
+            asyncio.run(svc._warm_once(fake_db))
+        acquire.assert_awaited_once()
+        compute.assert_not_awaited()
+
+    def test_warm_once_releases_lease_on_failure(self):
+        fake_db = object()
+        with patch(f"{SERVICE}.try_acquire_lease",
+                   new_callable=AsyncMock, return_value=True), \
+             patch(f"{SERVICE}.release_lease",
+                   new_callable=AsyncMock) as release, \
+             patch(f"{SERVICE}.resolve_comparison_window",
+                   return_value=("2026-01-01", "2026-06-30")), \
+             patch(f"{SERVICE}._compute_claim_payment_comparison",
+                   new_callable=AsyncMock,
+                   side_effect=RuntimeError("boom")):
+            with pytest.raises(RuntimeError):
+                asyncio.run(svc._warm_once(fake_db))
+        release.assert_awaited_once()
 
     def test_cache_serves_stale_over_incomplete_recompute(self):
         from ai_analytics import cache as cache_mod
