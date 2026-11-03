@@ -69,8 +69,8 @@ const sectionTitleStyle: React.CSSProperties = {
 
 const pct = (value: number | null): string => (value === null ? '—' : formatPercent(value));
 
-// Shares are over the whole displayed population; `total` excludes
-// not-billable claims, so it is added back for the per-status shares.
+// Shares are over the whole displayed population; `total` counts only
+// finished claims, so not-billable is added back for per-status shares.
 const share = (count: number, b: ClaimStatusBreakdown): string => {
   const population = b.total + b.not_billable;
   return population > 0 ? `${((count / population) * 100).toFixed(1)}%` : '—';
@@ -152,8 +152,8 @@ const CohortStatusTable: React.FC<{ data: AiClaimComparisonResponse }> = ({ data
         </table>
       </div>
       <div style={{ marginTop: '10px', fontSize: '11px', color: 'var(--text-muted)' }}>
-        Rates divide by claims that finished the process (paid + ready to be paid + denied).
-        In-progress, under-review, and not billable claims are excluded from denominators;
+        Totals and rates count only claims that finished the process (paid + ready to be paid + denied).
+        In-progress, under-review, and not billable claims never make up a total;
         AI-pending claims ({data.ai_pending.toLocaleString()}) are excluded from all rates.
       </div>
     </SectionCard>

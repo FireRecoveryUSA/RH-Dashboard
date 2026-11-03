@@ -220,13 +220,13 @@ def _breakdown(outcomes: List[_ClaimOutcome]) -> ClaimStatusBreakdown:
     paid = counts[BUCKET_PAID]
     ready = counts[BUCKET_READY_TO_BE_PAID]
     denied = counts[BUCKET_DENIED]
-    # Rates only divide by claims that finished the process (paid, ready to
-    # be paid, denied). in_progress and under_review still appear in `total`
-    # and their own columns; not billable never counts toward `total`.
+    # `total` counts only claims that finished the process (paid, ready to
+    # be paid, denied) — the same claims the rates divide by. in_progress,
+    # under_review and not_billable never make up a total.
     successes = paid + ready
     final = successes + denied
     return ClaimStatusBreakdown(
-        total=len(resolved) - counts[BUCKET_NOT_BILLABLE],
+        total=final,
         paid=paid,
         ready_to_be_paid=ready,
         under_review=counts[BUCKET_UNDER_REVIEW],
