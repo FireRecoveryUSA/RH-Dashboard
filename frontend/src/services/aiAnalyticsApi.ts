@@ -418,6 +418,105 @@ function buildQueryParams(filters: AiAnalyticsFilters): URLSearchParams {
   return params;
 }
 
+// Claim Payment Comparison — mirror ai_analytics/models.py
+
+export interface ClaimStatusBreakdown {
+  total: number;
+  paid: number;
+  ready_to_be_paid: number;
+  under_review: number;
+  in_progress: number;
+  denied: number;
+  not_billable: number;
+  paid_rate: number | null;
+  resolved_success_rate: number | null;
+  denied_rate: number | null;
+}
+
+export interface ClaimComparisonSegment {
+  label: string;
+  overall: ClaimStatusBreakdown;
+  ai_released: ClaimStatusBreakdown;
+  other: ClaimStatusBreakdown;
+}
+
+export interface ClaimComparisonWeeklyCounts {
+  paid: number;
+  ready_to_be_paid: number;
+  denied: number;
+  resolved_success_rate: number | null;
+}
+
+export interface ClaimComparisonWeek {
+  week: string;
+  week_start: string;
+  ai_released: ClaimComparisonWeeklyCounts;
+  other: ClaimComparisonWeeklyCounts;
+  other_manual: ClaimComparisonWeeklyCounts;
+  other_ai_rejected: ClaimComparisonWeeklyCounts;
+}
+
+export interface ClaimComparisonNotBillableCohort {
+  ever_not_billable: number;
+  effective_status: Record<string, number>;
+  ready_or_paid: number;
+  denied: number;
+  ready_vs_denied_rate: number | null;
+}
+
+export interface ClaimComparisonNotBillable {
+  ai_released: ClaimComparisonNotBillableCohort;
+  other: ClaimComparisonNotBillableCohort;
+  marked_by_processor: number;
+  identified_by_system: number;
+}
+
+export interface AiClaimComparisonResponse {
+  period_start: string;
+  period_end: string;
+  overall: ClaimStatusBreakdown;
+  ai_released: ClaimStatusBreakdown;
+  other: ClaimStatusBreakdown;
+  other_manual: ClaimStatusBreakdown;
+  other_ai_rejected: ClaimStatusBreakdown;
+  ai_pending: number;
+  deleted_runs: number;
+  unresolved_claims: number;
+  weekly: ClaimComparisonWeek[];
+  by_incident_type: ClaimComparisonSegment[];
+  by_billing_target: ClaimComparisonSegment[];
+  not_billable: ClaimComparisonNotBillable;
+  unmapped_statuses: Record<string, number>;
+  resolved_columns: Record<string, string | null>;
+  source_status: Record<string, string>;
+  data_complete: boolean;
+}
+
+export interface ClaimStatusValueCheck {
+  status: string | null;
+  claim_count: number;
+  bucket: string;
+  mapped: boolean;
+}
+
+export interface RunTypeValueCheck {
+  type_id: number | null;
+  type_name: string | null;
+  label: string;
+  claim_count: number;
+}
+
+export interface AiClaimComparisonSchemaCheck {
+  period_start: string;
+  period_end: string;
+  status_values: ClaimStatusValueCheck[];
+  run_type_values: RunTypeValueCheck[];
+  resolved_columns: Record<string, string | null>;
+  claims_deleted_columns: string[];
+  source_status: Record<string, string>;
+  data_complete: boolean;
+}
+
 export const aiAnalyticsApi = {
   getOutcomeSummary: (filters: AiAnalyticsFilters): Promise<AiOutcomeSummary> => {
     const params = buildQueryParams(filters);
@@ -457,6 +556,15 @@ export const aiAnalyticsApi = {
     const params = buildQueryParams(filters);
     return aiAnalyticsFetch<AiBillabilityStat>(`/billability/stats?${params.toString()}`);
   },
+
+  getClaimComparison: (departmentId?: number): Promise<AiClaimComparisonResponse> => {
+    const params = new URLSearchParams();
+    if (departmentId !== undefined) params.set('department_id', String(departmentId));
+    return aiAnalyticsFetch<AiClaimComparisonResponse>(`/claim-comparison?${params.toString()}`);
+  },
+
+  getClaimComparisonSchemaCheck: (): Promise<AiClaimComparisonSchemaCheck> =>
+    aiAnalyticsFetch<AiClaimComparisonSchemaCheck>('/claim-comparison/schema-check'),
 
   // Diagnostics
 

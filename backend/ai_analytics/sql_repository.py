@@ -12,6 +12,7 @@ import logging
 from typing import Any, Dict, List, Optional
 
 from target_db import target_db, TargetDatabaseError
+from ai_adoption_service import EXCLUDED_DEPARTMENT_IDS
 
 logger = logging.getLogger(__name__)
 
@@ -491,3 +492,185 @@ def get_cancellation_reason_inventory() -> List[Dict[str, Any]]:
     except TargetDatabaseError as e:
         logger.error(f"Failed to fetch cancellation reason inventory: {e}")
         raise
+
+
+# ---------------------------------------------------------------------------
+# Claim payment comparison (read-only)
+# ---------------------------------------------------------------------------
+
+def get_server_date() -> str:
+    """Current date from SQL Server (ISO string), via target_db's cached clock."""
+    return target_db.get_server_date().isoformat()
+
+
+_EXCLUDED_DEPT_SQL = ",".join(str(int(d)) for d in sorted(EXCLUDED_DEPARTMENT_IDS))
+
+_CLAIM_SCOPE_WHERE = f"""
+  c.submitted = 1
+  AND c.original_run_id IS NOT NULL
+  AND c.date_of_submitted >= %(start_date)s
+  AND c.date_of_submitted < DATEADD(day, 1, %(end_date)s)
+  AND (%(department_id)s IS NULL OR c.dept_id = %(department_id)s)
+  AND (c.dept_id IS NULL OR c.dept_id NOT IN ({_EXCLUDED_DEPT_SQL}))
+"""
+
+_row_start_column_cache: Dict[str, str] = {}
+
+
+def get_table_column_names(table_name: str) -> List[str]:
+    """Column names of a dbo table, in ordinal order."""
+    query = """
+    SELECT c.COLUMN_NAME
+    FROM INFORMATION_SCHEMA.COLUMNS c
+    WHERE c.TABLE_SCHEMA = 'dbo' AND c.TABLE_NAME = %(table_name)s
+    ORDER BY c.ORDINAL_POSITION
+    """
+    rows = _execute_parameterized(query, {"table_name": table_name})
+    return [str(r["COLUMN_NAME"]) for r in rows if r.get("COLUMN_NAME")]
+
+
+def get_claims_row_start_column() -> str:
+    """Name of Claims' AS_ROW_START temporal column, resolved from metadata."""
+    if "Claims" in _row_start_column_cache:
+        return _row_start_column_cache["Claims"]
+    query = """
+    SELECT TOP 1 c.name AS column_name
+    FROM sys.tables t
+    INNER JOIN sys.columns c ON c.object_id = t.object_id
+    WHERE t.name = 'Claims'
+      AND c.generated_always_type_desc = 'AS_ROW_START'
+    """
+    rows = _execute_raw_sql(query)
+    if not rows or not rows[0].get("column_name"):
+        raise TargetDatabaseError("Claims has no AS_ROW_START column; cannot read status history.")
+    _row_start_column_cache["Claims"] = str(rows[0]["column_name"])
+    return _row_start_column_cache["Claims"]
+
+
+def _quote_identifier(name: str) -> str:
+    return "[" + name.replace("]", "]]") + "]"
+
+
+def get_claim_comparison_scope(
+    start_date: str,
+    end_date: str,
+    department_id: Optional[int],
+) -> List[Dict[str, Any]]:
+    """In-scope runs submitted in the window, excluding Rural Metro departments."""
+    query = f"""
+    SELECT
+        c.id,
+        c.dept_id,
+        c.run_number,
+        c.date_of_submitted,
+        d.Name AS department_name,
+        c.type_id,
+        rt.type AS type_name
+    FROM dbo.Claims c
+    LEFT JOIN dbo.Departments d ON d.ID = c.dept_id
+    LEFT JOIN dbo.run_types rt ON rt.id = c.type_id
+    WHERE {_CLAIM_SCOPE_WHERE}
+    """
+    return _execute_parameterized(
+        query,
+        {"start_date": start_date, "end_date": end_date, "department_id": department_id},
+    )
+
+
+def get_run_type_values(start_date: str, end_date: str) -> List[Dict[str, Any]]:
+    """Run types with the number of in-scope runs using each (schema check)."""
+    query = f"""
+    SELECT
+        c.type_id,
+        rt.type AS type_name,
+        COUNT(*) AS claim_count
+    FROM dbo.Claims c
+    LEFT JOIN dbo.run_types rt ON rt.id = c.type_id
+    WHERE {_CLAIM_SCOPE_WHERE}
+    GROUP BY c.type_id, rt.type
+    ORDER BY claim_count DESC
+    """
+    return _execute_parameterized(
+        query,
+        {"start_date": start_date, "end_date": end_date, "department_id": None},
+    )
+
+
+def get_scope_status_counts(start_date: str, end_date: str) -> List[Dict[str, Any]]:
+    """Current Claims.status values among in-scope runs, with counts (schema check)."""
+    query = f"""
+    SELECT c.status, COUNT(*) AS claim_count
+    FROM dbo.Claims c
+    WHERE {_CLAIM_SCOPE_WHERE}
+    GROUP BY c.status
+    ORDER BY claim_count DESC
+    """
+    return _execute_parameterized(
+        query,
+        {"start_date": start_date, "end_date": end_date, "department_id": None},
+    )
+
+
+def get_deleted_runs_count(
+    start_date: str,
+    end_date: str,
+    department_id: Optional[int],
+) -> int:
+    """Deleted runs created in the window (dbo.claims_deleted), excluding Rural Metro.
+
+    ``dept_id`` on claims_deleted is not verified against production; the
+    schema-check endpoint reports the table's columns.
+    """
+    query = f"""
+    SELECT COUNT(DISTINCT x.id) AS deleted_runs
+    FROM dbo.claims_deleted x
+    WHERE x.submitted = 1
+      AND x.original_run_id IS NOT NULL
+      AND x.created >= %(start_date)s
+      AND x.created < DATEADD(day, 1, %(end_date)s)
+      AND (%(department_id)s IS NULL OR x.dept_id = %(department_id)s)
+      AND (x.dept_id IS NULL OR x.dept_id NOT IN ({_EXCLUDED_DEPT_SQL}))
+    """
+    rows = _execute_parameterized(
+        query,
+        {"start_date": start_date, "end_date": end_date, "department_id": department_id},
+    )
+    return int(rows[0]["deleted_runs"]) if rows else 0
+
+
+def get_claim_status_versions(
+    claim_ids: List[int],
+    row_start_column: str,
+) -> List[Dict[str, Any]]:
+    """Distinct (status) versions per claim across current and history rows.
+
+    History is filtered by claim id only. Never use FOR SYSTEM_TIME here:
+    AuditData.claimsHistory is 38.6M+ rows.
+    """
+    if not claim_ids:
+        return []
+    row_start = _quote_identifier(row_start_column)
+    claim_ids_csv = ",".join(str(int(cid)) for cid in claim_ids)
+    query = f"""
+    SELECT
+        x.id,
+        x.status,
+        MIN(x.row_start) AS first_start,
+        MAX(x.row_start) AS last_start,
+        MAX(x.is_current) AS is_current
+    FROM (
+        SELECT c.id, c.status, c.{row_start} AS row_start, CAST(1 AS int) AS is_current
+        FROM dbo.Claims c
+        WHERE c.id IN (
+            SELECT CAST(value AS int) FROM STRING_SPLIT(CAST(%(claim_ids_csv)s AS nvarchar(max)), ',')
+        )
+        UNION ALL
+        SELECT h.id, h.status, h.{row_start} AS row_start, CAST(0 AS int) AS is_current
+        FROM AuditData.claimsHistory h
+        WHERE h.id IN (
+            SELECT CAST(value AS int) FROM STRING_SPLIT(CAST(%(claim_ids_csv)s AS nvarchar(max)), ',')
+        )
+    ) x
+    GROUP BY x.id, x.status
+    """
+    return _execute_parameterized(query, {"claim_ids_csv": claim_ids_csv})

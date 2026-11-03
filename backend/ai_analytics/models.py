@@ -327,3 +327,113 @@ class AiInvoiceTrace(BaseModel):
     raw_ai_record: Optional[Dict[str, Any]] = None
     source_status: Dict[str, str] = Field(default_factory=dict)
     data_complete: bool = True
+
+
+# ---------------------------------------------------------------------------
+# Claim payment comparison models
+# ---------------------------------------------------------------------------
+
+class ClaimStatusBreakdown(BaseModel):
+    """Final-payment bucket counts and rates for one population of claims."""
+
+    total: int = 0
+    paid: int = 0
+    ready_to_be_paid: int = 0
+    under_review: int = 0
+    in_progress: int = 0
+    denied: int = 0
+    not_billable: int = 0
+    paid_rate: Optional[float] = None
+    resolved_success_rate: Optional[float] = None
+    denied_rate: Optional[float] = None
+
+
+class ClaimComparisonSegment(BaseModel):
+    label: str
+    overall: ClaimStatusBreakdown
+    ai_released: ClaimStatusBreakdown
+    other: ClaimStatusBreakdown
+
+
+class ClaimComparisonWeeklyCounts(BaseModel):
+    paid: int = 0
+    ready_to_be_paid: int = 0
+    denied: int = 0
+    resolved_success_rate: Optional[float] = None
+
+
+class ClaimComparisonWeek(BaseModel):
+    week: str
+    week_start: str
+    ai_released: ClaimComparisonWeeklyCounts
+    other: ClaimComparisonWeeklyCounts
+    other_manual: ClaimComparisonWeeklyCounts
+    other_ai_rejected: ClaimComparisonWeeklyCounts
+
+
+class ClaimComparisonNotBillableCohort(BaseModel):
+    ever_not_billable: int = 0
+    effective_status: Dict[str, int] = Field(default_factory=dict)
+    ready_or_paid: int = 0
+    denied: int = 0
+    ready_vs_denied_rate: Optional[float] = None
+
+
+class ClaimComparisonNotBillable(BaseModel):
+    """Claims whose status history ever reached not_billable.
+
+    ``marked_by_processor`` comes from Claims status history.
+    ``identified_by_system`` comes from Mongo billability (is_billable false).
+    The two are reported separately and never summed.
+    """
+
+    ai_released: ClaimComparisonNotBillableCohort
+    other: ClaimComparisonNotBillableCohort
+    marked_by_processor: int = 0
+    identified_by_system: int = 0
+
+
+class AiClaimComparisonResponse(BaseModel):
+    period_start: str
+    period_end: str
+    overall: ClaimStatusBreakdown
+    ai_released: ClaimStatusBreakdown
+    other: ClaimStatusBreakdown
+    other_manual: ClaimStatusBreakdown
+    other_ai_rejected: ClaimStatusBreakdown
+    ai_pending: int = 0
+    deleted_runs: int = 0
+    unresolved_claims: int = 0
+    weekly: List[ClaimComparisonWeek] = Field(default_factory=list)
+    by_incident_type: List[ClaimComparisonSegment] = Field(default_factory=list)
+    by_billing_target: List[ClaimComparisonSegment] = Field(default_factory=list)
+    not_billable: ClaimComparisonNotBillable
+    unmapped_statuses: Dict[str, int] = Field(default_factory=dict)
+    resolved_columns: Dict[str, Optional[str]] = Field(default_factory=dict)
+    source_status: Dict[str, str] = Field(default_factory=dict)
+    data_complete: bool = True
+
+
+class ClaimStatusValueCheck(BaseModel):
+    status: Optional[str]
+    claim_count: int
+    bucket: str
+    mapped: bool
+
+
+class RunTypeValueCheck(BaseModel):
+    type_id: Optional[int]
+    type_name: Optional[str]
+    label: str
+    claim_count: int
+
+
+class AiClaimComparisonSchemaCheck(BaseModel):
+    period_start: str
+    period_end: str
+    status_values: List[ClaimStatusValueCheck] = Field(default_factory=list)
+    run_type_values: List[RunTypeValueCheck] = Field(default_factory=list)
+    resolved_columns: Dict[str, Optional[str]] = Field(default_factory=dict)
+    claims_deleted_columns: List[str] = Field(default_factory=list)
+    source_status: Dict[str, str] = Field(default_factory=dict)
+    data_complete: bool = True

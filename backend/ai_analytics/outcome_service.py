@@ -636,6 +636,12 @@ async def get_outcome_funnel(
 # Trend
 # ---------------------------------------------------------------------------
 
+def iso_week_key(dt: datetime) -> str:
+    """ISO week label (``YYYY-Www``) shared by the weekly analytics series."""
+    iso_year, iso_week, _ = dt.isocalendar()
+    return f"{iso_year}-W{iso_week:02d}"
+
+
 async def get_outcome_trend(
     ai_db,
     filters: AiAnalyticsFilters,
@@ -670,9 +676,7 @@ async def get_outcome_trend(
             continue
 
         if grain == "week":
-            # ISO week
-            iso_year, iso_week, _ = dt.isocalendar()
-            key = f"{iso_year}-W{iso_week:02d}"
+            key = iso_week_key(dt)
         elif grain == "month":
             key = f"{dt.year}-{dt.month:02d}"
         else:
