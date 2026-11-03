@@ -461,7 +461,7 @@ export const AiClaimComparisonDashboard: React.FC = () => {
     <div style={billingStyles.page}>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' }}>
         <span style={{ fontSize: '13px', color: 'var(--text-muted)' }}>
-          Year to date: {data.period_start} → {data.period_end}. Final payment result per run; Rural Metro
+          Period (from Jul 1): {data.period_start} → {data.period_end}. Final payment result per run; Rural Metro
           departments excluded.
         </span>
         <SyncHealthIndicator />
