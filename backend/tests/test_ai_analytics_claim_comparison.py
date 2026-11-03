@@ -700,6 +700,23 @@ class TestCacheWarmer:
 
     def test_warm_once_does_not_release_lease_on_cancel(self):
         fake_db = object()
+        async def cancelled_mid_scan(_db):
+            svc._WARM_SCAN_RUNNING = True  # to_thread read still running
+            raise asyncio.CancelledError
+        with patch(f"{SERVICE}.try_acquire_lease",
+                   new_callable=AsyncMock, return_value=True), \
+             patch(f"{SERVICE}.release_lease",
+                   new_callable=AsyncMock) as release, \
+             patch(f"{SERVICE}._warm_once_uncached",
+                   new_callable=AsyncMock,
+                   side_effect=cancelled_mid_scan):
+            with pytest.raises(asyncio.CancelledError):
+                asyncio.run(svc._warm_once(fake_db))
+        release.assert_not_awaited()
+        svc._WARM_SCAN_RUNNING = False
+
+    def test_warm_once_releases_lease_when_cancelled_off_scan(self):
+        fake_db = object()
         with patch(f"{SERVICE}.try_acquire_lease",
                    new_callable=AsyncMock, return_value=True), \
              patch(f"{SERVICE}.release_lease",
@@ -709,7 +726,23 @@ class TestCacheWarmer:
                    side_effect=asyncio.CancelledError):
             with pytest.raises(asyncio.CancelledError):
                 asyncio.run(svc._warm_once(fake_db))
-        release.assert_not_awaited()
+        release.assert_awaited_once()
+
+    def test_prime_from_shared_result_rejects_window_mismatch(self):
+        from datetime import UTC, datetime
+        fake_db = MagicMock()
+        collection = fake_db.__getitem__.return_value
+        collection.find_one = AsyncMock(return_value={
+            "_id": svc.WARM_RESULT_DOC_ID,
+            "computed_at": datetime.now(UTC),
+            "value": {"period_start": "2026-01-01",
+                      "period_end": "2026-06-30"},
+        })
+        with patch(f"{SERVICE}.resolve_comparison_window",
+                   return_value=("2026-01-01", "2026-07-01")), \
+             patch(f"{SERVICE}.prime_cache") as prime:
+            asyncio.run(svc._prime_from_shared_result(fake_db))
+        prime.assert_not_called()
 
     def test_warm_once_releases_lease_on_failure(self):
         fake_db = object()

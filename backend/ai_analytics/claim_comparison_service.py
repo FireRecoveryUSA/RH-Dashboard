@@ -542,6 +542,12 @@ _WARM_HOLDER_ID = (
     f"{socket.gethostname()}:{os.getpid()}:warm:{uuid.uuid4().hex[:8]}"
 )
 
+# True while the heavy history read is (or may still be) running on a
+# thread. Set before the compute await and cleared only when it returns
+# normally or raises — on cancellation the thread outlives the task, so it
+# stays True and the warm lease is left to lapse on its own.
+_WARM_SCAN_RUNNING = False
+
 
 # Worker-state doc the lease holder publishes its completed result to, so
 # non-holder processes can prime their own in-memory caches without
@@ -565,15 +571,19 @@ async def _warm_once(ai_db) -> None:
         return
     try:
         await _warm_once_uncached(ai_db)
+    except asyncio.CancelledError:
+        # Only keep the lease when the history scan may still be running on
+        # its thread — releasing then would let a peer start a concurrent
+        # scan. Cancelled before/after the scan (e.g. mid-publish) releases
+        # normally so replacement workers aren't blocked by a dead holder.
+        if not _WARM_SCAN_RUNNING:
+            await release_lease(ai_db, WARM_RUN_LOCK_ID, _WARM_HOLDER_ID)
+        raise
     except Exception:
         await release_lease(ai_db, WARM_RUN_LOCK_ID, _WARM_HOLDER_ID)
         raise
     else:
         await release_lease(ai_db, WARM_RUN_LOCK_ID, _WARM_HOLDER_ID)
-    # CancelledError is not caught above: cancellation means the asyncio
-    # task is torn down while the asyncio.to_thread SQL read keeps running,
-    # so the lease must stay held and lapse on its own — releasing it now
-    # would let a peer start a second concurrent scan.
 
 
 async def _prime_from_shared_result(ai_db) -> None:
@@ -599,14 +609,30 @@ async def _prime_from_shared_result(ai_db) -> None:
             )
             return
         start, end = await asyncio.to_thread(resolve_comparison_window, None)
+        payload = doc["value"]
+        if (
+            payload.get("period_start") != start
+            or payload.get("period_end") != end
+        ):
+            # The shared result covers a different window (e.g. computed
+            # yesterday, read after midnight) — never prime it under
+            # today's cache key.
+            logger.info(
+                "Shared claim comparison result is for %s..%s, not %s..%s; skipping prime",
+                payload.get("period_start"), payload.get("period_end"),
+                start, end,
+            )
+            return
         filters = AiAnalyticsFilters(start_date=start, end_date=end,
                                      department_id=None)
+        # Remaining lifetime only: the primed entry must die at the
+        # original computed_at + TTL, not get a fresh full TTL.
         prime_cache(
             "get_claim_payment_comparison",
             (ai_db, filters),
             {},
-            AiClaimComparisonResponse.model_validate(doc["value"]),
-            CACHE_TTL_SECONDS,
+            AiClaimComparisonResponse.model_validate(payload),
+            CACHE_TTL_SECONDS - age,
             computed_at=computed_at.timestamp(),
         )
         logger.info("Claim comparison cache primed from shared result")
@@ -615,13 +641,23 @@ async def _prime_from_shared_result(ai_db) -> None:
 
 
 async def _warm_once_uncached(ai_db) -> None:
+    global _WARM_SCAN_RUNNING
     start, end = await asyncio.to_thread(resolve_comparison_window, None)
     filters = AiAnalyticsFilters(
         start_date=start,
         end_date=end,
         department_id=None,
     )
-    value = await _compute_claim_payment_comparison(ai_db, filters)
+    _WARM_SCAN_RUNNING = True
+    try:
+        value = await _compute_claim_payment_comparison(ai_db, filters)
+    except asyncio.CancelledError:
+        raise  # keep _WARM_SCAN_RUNNING: the to_thread read outlives the task
+    except Exception:
+        _WARM_SCAN_RUNNING = False
+        raise
+    else:
+        _WARM_SCAN_RUNNING = False
     if not value.data_complete:
         # Don't overwrite the last good entry with an empty result from a
         # transient outage — and extend its expiry so requests keep being
