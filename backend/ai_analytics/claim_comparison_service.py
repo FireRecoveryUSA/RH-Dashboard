@@ -27,8 +27,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import socket
+import time
+import uuid
 from collections import Counter, defaultdict
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 
 from .models import (
@@ -48,6 +51,8 @@ from . import sql_repository as sql_repo
 from .outcome_service import _load_normalized_cohort, iso_week_key
 from config import settings
 from .normalization_core import classify_billability
+from ai_analytics_worker.config import worker_config
+from ai_analytics_worker.leader_election import release_lease, try_acquire_lease
 from .claim_status_config import (
     BUCKET_ARCHIVE,
     BUCKET_DENIED,
@@ -69,10 +74,10 @@ logger = logging.getLogger(__name__)
 
 HISTORY_CHUNK_SIZE = 2000
 
-# Cache TTL is longer than the default warm interval so a request between two
-# warm runs still hits the cache instead of recomputing against a cold SQL
-# buffer cache (a cold history read exceeds the proxy's 180s timeout).
-CACHE_TTL_SECONDS = 900
+# Cache TTL must exceed the warm interval plus a margin for the warm compute
+# itself (~230s cold), or requests between warms would recompute against a
+# cold SQL buffer cache (exceeding the proxy's 180s timeout).
+CACHE_TTL_SECONDS = 3600
 
 COHORT_AI_RELEASED = "ai_released"
 COHORT_OTHER = "other"
@@ -159,7 +164,8 @@ def _fetch_status_versions(
     """
     versions: Dict[int, List[Tuple[str, str, datetime, bool]]] = defaultdict(list)
     unmapped: Counter = Counter()
-    for chunk in _chunks(claim_ids, HISTORY_CHUNK_SIZE):
+    chunks = list(_chunks(claim_ids, HISTORY_CHUNK_SIZE))
+    for i, chunk in enumerate(chunks):
         for row in sql_repo.get_claim_status_versions(chunk, row_start_column, as_of):
             claim_id = row.get("id")
             last_start = row.get("last_start")
@@ -176,6 +182,10 @@ def _fetch_status_versions(
                 last_start_dt,
                 bool(row.get("is_current")),
             ))
+        # Pace chunk reads so a full history scan can't starve the shared
+        # Azure SQL (other dashboards' queries interleave between chunks).
+        if i < len(chunks) - 1:
+            time.sleep(_chunk_delay_seconds())
     return versions, unmapped
 
 
@@ -502,14 +512,47 @@ async def get_claim_payment_comparison(
     return await _compute_claim_payment_comparison(ai_db, filters)
 
 
+def _chunk_delay_seconds() -> float:
+    """Yield between chunked history reads; CLAIM_COMPARISON_CHUNK_DELAY_MS, default 100."""
+    try:
+        return max(0.0, float(os.environ.get("CLAIM_COMPARISON_CHUNK_DELAY_MS", "100")) / 1000)
+    except ValueError:
+        logger.warning("Invalid CLAIM_COMPARISON_CHUNK_DELAY_MS; using 100")
+        return 0.1
+
+
 def _warm_interval_seconds() -> int:
     try:
-        return int(os.environ.get("CLAIM_COMPARISON_WARM_INTERVAL_SECONDS", "600"))
+        return int(os.environ.get("CLAIM_COMPARISON_WARM_INTERVAL_SECONDS", "1800"))
     except ValueError:
         logger.warning(
-            "Invalid CLAIM_COMPARISON_WARM_INTERVAL_SECONDS; using 600"
+            "Invalid CLAIM_COMPARISON_WARM_INTERVAL_SECONDS; using 1800"
         )
-        return 600
+        return 1800
+
+
+# Mongo lease serializing warm scans across uvicorn workers: each process
+# runs its own warmer (its in-memory cache needs priming too), but the
+# lease lets only one process run the heavy history scan at a time.
+WARM_RUN_LOCK_ID = "comparison_warm_run"
+# Long enough to cover the worst-case warm (~230 s); if the holder dies the
+# lease lapses and a peer resumes scanning instead of stalling forever.
+_WARM_RUN_LEASE_SECONDS = 900
+_WARM_HOLDER_ID = (
+    f"{socket.gethostname()}:{os.getpid()}:warm:{uuid.uuid4().hex[:8]}"
+)
+
+# True while the heavy history read is (or may still be) running on a
+# thread. Set before the compute await and cleared only when it returns
+# normally or raises — on cancellation the thread outlives the task, so it
+# stays True and the warm lease is left to lapse on its own.
+_WARM_SCAN_RUNNING = False
+
+
+# Worker-state doc the lease holder publishes its completed result to, so
+# non-holder processes can prime their own in-memory caches without
+# running the history scan again.
+WARM_RESULT_DOC_ID = "comparison_warm_result"
 
 
 async def _warm_once(ai_db) -> None:
@@ -519,13 +562,102 @@ async def _warm_once(ai_db) -> None:
     entry and never extend its expiry, leaving a cold-recompute window where
     the ~230 s history read exceeds the 180 s proxy timeout.
     """
+    if not await try_acquire_lease(
+        ai_db, WARM_RUN_LOCK_ID, _WARM_HOLDER_ID, _WARM_RUN_LEASE_SECONDS
+    ):
+        # Another worker is scanning (or recently did): prime this process's
+        # cache from the published result instead of a second scan.
+        await _prime_from_shared_result(ai_db)
+        return
+    try:
+        await _warm_once_uncached(ai_db)
+    except asyncio.CancelledError:
+        # Only keep the lease when the history scan may still be running on
+        # its thread — releasing then would let a peer start a concurrent
+        # scan. Cancelled before/after the scan (e.g. mid-publish) releases
+        # normally so replacement workers aren't blocked by a dead holder.
+        if not _WARM_SCAN_RUNNING:
+            await release_lease(ai_db, WARM_RUN_LOCK_ID, _WARM_HOLDER_ID)
+        raise
+    except Exception:
+        await release_lease(ai_db, WARM_RUN_LOCK_ID, _WARM_HOLDER_ID)
+        raise
+    else:
+        await release_lease(ai_db, WARM_RUN_LOCK_ID, _WARM_HOLDER_ID)
+
+
+async def _prime_from_shared_result(ai_db) -> None:
+    """Prime this process's cache from the result the lease holder published."""
+    try:
+        doc = await ai_db[worker_config.WORKER_STATE_COLLECTION].find_one(
+            {"_id": WARM_RESULT_DOC_ID}
+        )
+        if not doc or doc.get("value") is None:
+            logger.info(
+                "Claim comparison warm deferred; another worker is scanning "
+                "and no shared result exists yet"
+            )
+            return
+        computed_at = doc["computed_at"]
+        if computed_at.tzinfo is None:
+            computed_at = computed_at.replace(tzinfo=UTC)
+        age = (datetime.now(UTC) - computed_at).total_seconds()
+        if age >= CACHE_TTL_SECONDS:
+            logger.warning(
+                "Shared claim comparison result is stale (%ds old); skipping warm",
+                int(age),
+            )
+            return
+        start, end = await asyncio.to_thread(resolve_comparison_window, None)
+        payload = doc["value"]
+        if (
+            payload.get("period_start") != start
+            or payload.get("period_end") != end
+        ):
+            # The shared result covers a different window (e.g. computed
+            # yesterday, read after midnight) — never prime it under
+            # today's cache key.
+            logger.info(
+                "Shared claim comparison result is for %s..%s, not %s..%s; skipping prime",
+                payload.get("period_start"), payload.get("period_end"),
+                start, end,
+            )
+            return
+        filters = AiAnalyticsFilters(start_date=start, end_date=end,
+                                     department_id=None)
+        # Remaining lifetime only: the primed entry must die at the
+        # original computed_at + TTL, not get a fresh full TTL.
+        prime_cache(
+            "get_claim_payment_comparison",
+            (ai_db, filters),
+            {},
+            AiClaimComparisonResponse.model_validate(payload),
+            CACHE_TTL_SECONDS - age,
+            computed_at=computed_at.timestamp(),
+        )
+        logger.info("Claim comparison cache primed from shared result")
+    except Exception as e:
+        logger.warning(f"Shared claim comparison prime failed: {e}")
+
+
+async def _warm_once_uncached(ai_db) -> None:
+    global _WARM_SCAN_RUNNING
     start, end = await asyncio.to_thread(resolve_comparison_window, None)
     filters = AiAnalyticsFilters(
         start_date=start,
         end_date=end,
         department_id=None,
     )
-    value = await _compute_claim_payment_comparison(ai_db, filters)
+    _WARM_SCAN_RUNNING = True
+    try:
+        value = await _compute_claim_payment_comparison(ai_db, filters)
+    except asyncio.CancelledError:
+        raise  # keep _WARM_SCAN_RUNNING: the to_thread read outlives the task
+    except Exception:
+        _WARM_SCAN_RUNNING = False
+        raise
+    else:
+        _WARM_SCAN_RUNNING = False
     if not value.data_complete:
         # Don't overwrite the last good entry with an empty result from a
         # transient outage — and extend its expiry so requests keep being
@@ -552,6 +684,21 @@ async def _warm_once(ai_db) -> None:
         value,
         CACHE_TTL_SECONDS,
     )
+    # Publish so the other uvicorn workers can prime their own caches
+    # without rerunning the history scan.
+    try:
+        await ai_db[worker_config.WORKER_STATE_COLLECTION].replace_one(
+            {"_id": WARM_RESULT_DOC_ID},
+            {
+                "_id": WARM_RESULT_DOC_ID,
+                "computed_at": datetime.now(UTC),
+                "holder_id": _WARM_HOLDER_ID,
+                "value": value.model_dump(),
+            },
+            upsert=True,
+        )
+    except Exception as e:
+        logger.warning(f"Publishing shared claim comparison result failed: {e}")
 
 
 async def warm_claim_comparison_cache(

@@ -5,7 +5,7 @@ SQL and Mongo are mocked. Production Azure SQL is not reachable from dev machine
 
 import asyncio
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -28,7 +28,13 @@ from ai_analytics.claim_status_config import (
     incident_type_label,
     is_mapped_claim_status,
 )
-from ai_analytics.models import AiAnalyticsFilters
+from ai_analytics.models import (
+    AiAnalyticsFilters,
+    AiClaimComparisonResponse,
+    ClaimComparisonNotBillable,
+    ClaimComparisonNotBillableCohort,
+    ClaimStatusBreakdown,
+)
 
 AUTH = {"Authorization": "Bearer valid-mock-token"}
 ROW_START = "SysStartTime"
@@ -566,13 +572,31 @@ class TestChunkingAndSql:
 # ---------------------------------------------------------------------------
 
 class TestCacheWarmer:
-    def test_warm_interval_defaults_to_600(self, monkeypatch):
+    def test_warm_interval_defaults_to_1800(self, monkeypatch):
         monkeypatch.delenv("CLAIM_COMPARISON_WARM_INTERVAL_SECONDS", raising=False)
-        assert svc._warm_interval_seconds() == 600
+        assert svc._warm_interval_seconds() == 1800
 
     def test_warm_interval_invalid_value_falls_back(self, monkeypatch):
         monkeypatch.setenv("CLAIM_COMPARISON_WARM_INTERVAL_SECONDS", "bogus")
-        assert svc._warm_interval_seconds() == 600
+        assert svc._warm_interval_seconds() == 1800
+
+    def test_chunk_delay_defaults_to_100ms(self, monkeypatch):
+        monkeypatch.delenv("CLAIM_COMPARISON_CHUNK_DELAY_MS", raising=False)
+        assert svc._chunk_delay_seconds() == 0.1
+
+    def test_chunk_delay_invalid_value_falls_back(self, monkeypatch):
+        monkeypatch.setenv("CLAIM_COMPARISON_CHUNK_DELAY_MS", "bogus")
+        assert svc._chunk_delay_seconds() == 0.1
+
+    def test_status_version_chunks_are_paced(self, monkeypatch):
+        monkeypatch.setenv("CLAIM_COMPARISON_CHUNK_DELAY_MS", "50")
+        with patch(f"{SERVICE}._chunks",
+                   side_effect=lambda items, size: [items[:1], items[1:]]), \
+             patch(f"{SQL}.get_claim_status_versions", return_value=[]), \
+             patch(f"{SERVICE}.time.sleep") as sleep:
+            svc._fetch_status_versions([1, 2], ROW_START)
+        # Two chunks -> one inter-chunk yield of 50ms
+        sleep.assert_called_once_with(0.05)
 
     def test_warm_interval_zero_disables_warmer(self, monkeypatch):
         monkeypatch.setenv("CLAIM_COMPARISON_WARM_INTERVAL_SECONDS", "0")
@@ -581,7 +605,10 @@ class TestCacheWarmer:
     def test_warm_once_recomputes_and_primes_cache(self):
         fake_db = object()
         result = SimpleNamespace(data_complete=True)
-        with patch(f"{SERVICE}.resolve_comparison_window",
+        with patch(f"{SERVICE}.try_acquire_lease",
+                   new_callable=AsyncMock, return_value=True), \
+             patch(f"{SERVICE}.release_lease", new_callable=AsyncMock), \
+             patch(f"{SERVICE}.resolve_comparison_window",
                    return_value=("2026-01-01", "2026-06-30")), \
              patch(f"{SERVICE}._compute_claim_payment_comparison",
                    new_callable=AsyncMock, return_value=result) as compute, \
@@ -598,7 +625,10 @@ class TestCacheWarmer:
 
     def test_warm_once_keeps_previous_cache_on_incomplete_result(self):
         fake_db = object()
-        with patch(f"{SERVICE}.resolve_comparison_window",
+        with patch(f"{SERVICE}.try_acquire_lease",
+                   new_callable=AsyncMock, return_value=True), \
+             patch(f"{SERVICE}.release_lease", new_callable=AsyncMock), \
+             patch(f"{SERVICE}.resolve_comparison_window",
                    return_value=("2026-01-01", "2026-06-30")), \
              patch(f"{SERVICE}._compute_claim_payment_comparison",
                    new_callable=AsyncMock,
@@ -608,6 +638,126 @@ class TestCacheWarmer:
             asyncio.run(svc._warm_once(fake_db))
         prime.assert_not_called()
         touch.assert_called_once()
+
+    def test_warm_once_skips_when_another_worker_holds_lease(self):
+        fake_db = object()
+        with patch(f"{SERVICE}.try_acquire_lease",
+                   new_callable=AsyncMock, return_value=False) as acquire, \
+             patch(f"{SERVICE}._prime_from_shared_result",
+                   new_callable=AsyncMock) as prime_shared, \
+             patch(f"{SERVICE}._compute_claim_payment_comparison",
+                   new_callable=AsyncMock) as compute:
+            asyncio.run(svc._warm_once(fake_db))
+        acquire.assert_awaited_once()
+        compute.assert_not_awaited()
+        prime_shared.assert_awaited_once_with(fake_db)
+
+    def test_prime_from_shared_result_uses_published_value(self):
+        from datetime import UTC, datetime
+        fake_db = MagicMock()
+        collection = fake_db.__getitem__.return_value
+        value = AiClaimComparisonResponse(
+            period_start="2026-01-01",
+            period_end="2026-06-30",
+            overall=ClaimStatusBreakdown(),
+            ai_released=ClaimStatusBreakdown(),
+            other=ClaimStatusBreakdown(),
+            other_manual=ClaimStatusBreakdown(),
+            other_ai_rejected=ClaimStatusBreakdown(),
+            not_billable=ClaimComparisonNotBillable(
+                ai_released=ClaimComparisonNotBillableCohort(),
+                other=ClaimComparisonNotBillableCohort(),
+            ),
+            data_complete=True,
+        )
+        collection.find_one = AsyncMock(return_value={
+            "_id": svc.WARM_RESULT_DOC_ID,
+            "computed_at": datetime.now(UTC),
+            "value": value.model_dump(),
+        })
+        with patch(f"{SERVICE}.resolve_comparison_window",
+                   return_value=("2026-01-01", "2026-06-30")), \
+             patch(f"{SERVICE}.prime_cache") as prime:
+            asyncio.run(svc._prime_from_shared_result(fake_db))
+        prime.assert_called_once()
+        primed = prime.call_args[0][3]
+        assert isinstance(primed, AiClaimComparisonResponse)
+        assert primed.data_complete is True
+
+    def test_prime_from_shared_result_rejects_stale_doc(self):
+        from datetime import UTC, datetime, timedelta
+        fake_db = MagicMock()
+        collection = fake_db.__getitem__.return_value
+        collection.find_one = AsyncMock(return_value={
+            "_id": svc.WARM_RESULT_DOC_ID,
+            "computed_at": datetime.now(UTC)
+            - timedelta(seconds=svc.CACHE_TTL_SECONDS + 1),
+            "value": {"data_complete": True},
+        })
+        with patch(f"{SERVICE}.prime_cache") as prime:
+            asyncio.run(svc._prime_from_shared_result(fake_db))
+        prime.assert_not_called()
+
+    def test_warm_once_does_not_release_lease_on_cancel(self):
+        fake_db = object()
+        async def cancelled_mid_scan(_db):
+            svc._WARM_SCAN_RUNNING = True  # to_thread read still running
+            raise asyncio.CancelledError
+        with patch(f"{SERVICE}.try_acquire_lease",
+                   new_callable=AsyncMock, return_value=True), \
+             patch(f"{SERVICE}.release_lease",
+                   new_callable=AsyncMock) as release, \
+             patch(f"{SERVICE}._warm_once_uncached",
+                   new_callable=AsyncMock,
+                   side_effect=cancelled_mid_scan):
+            with pytest.raises(asyncio.CancelledError):
+                asyncio.run(svc._warm_once(fake_db))
+        release.assert_not_awaited()
+        svc._WARM_SCAN_RUNNING = False
+
+    def test_warm_once_releases_lease_when_cancelled_off_scan(self):
+        fake_db = object()
+        with patch(f"{SERVICE}.try_acquire_lease",
+                   new_callable=AsyncMock, return_value=True), \
+             patch(f"{SERVICE}.release_lease",
+                   new_callable=AsyncMock) as release, \
+             patch(f"{SERVICE}._warm_once_uncached",
+                   new_callable=AsyncMock,
+                   side_effect=asyncio.CancelledError):
+            with pytest.raises(asyncio.CancelledError):
+                asyncio.run(svc._warm_once(fake_db))
+        release.assert_awaited_once()
+
+    def test_prime_from_shared_result_rejects_window_mismatch(self):
+        from datetime import UTC, datetime
+        fake_db = MagicMock()
+        collection = fake_db.__getitem__.return_value
+        collection.find_one = AsyncMock(return_value={
+            "_id": svc.WARM_RESULT_DOC_ID,
+            "computed_at": datetime.now(UTC),
+            "value": {"period_start": "2026-01-01",
+                      "period_end": "2026-06-30"},
+        })
+        with patch(f"{SERVICE}.resolve_comparison_window",
+                   return_value=("2026-01-01", "2026-07-01")), \
+             patch(f"{SERVICE}.prime_cache") as prime:
+            asyncio.run(svc._prime_from_shared_result(fake_db))
+        prime.assert_not_called()
+
+    def test_warm_once_releases_lease_on_failure(self):
+        fake_db = object()
+        with patch(f"{SERVICE}.try_acquire_lease",
+                   new_callable=AsyncMock, return_value=True), \
+             patch(f"{SERVICE}.release_lease",
+                   new_callable=AsyncMock) as release, \
+             patch(f"{SERVICE}.resolve_comparison_window",
+                   return_value=("2026-01-01", "2026-06-30")), \
+             patch(f"{SERVICE}._compute_claim_payment_comparison",
+                   new_callable=AsyncMock,
+                   side_effect=RuntimeError("boom")):
+            with pytest.raises(RuntimeError):
+                asyncio.run(svc._warm_once(fake_db))
+        release.assert_awaited_once()
 
     def test_cache_serves_stale_over_incomplete_recompute(self):
         from ai_analytics import cache as cache_mod

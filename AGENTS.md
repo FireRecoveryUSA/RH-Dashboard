@@ -801,10 +801,12 @@ excluded from every rate.
 - **Incident type** (per run, same for AI and manual): `Claims.type_id` joined to
   `dbo.run_types.type`. NULL type is "Unspecified". A type_id with no run_types
   row is "Type {id}". AI `billing_category` is not used, since it is AI-only.
-- **Code**: `ai_analytics/claim_comparison_service.py` (service, cached 900s and
+- **Code**: `ai_analytics/claim_comparison_service.py` (service, cached 3600s and
   refreshed by a background warmer every `CLAIM_COMPARISON_WARM_INTERVAL_SECONDS`,
-  default 600s, so requests never hit the ~230s cold history read that exceeds
-  the 180s proxy timeout),
+  default 1800s, so requests never hit the ~230s cold history read that exceeds
+  the 180s proxy timeout; chunked history reads are paced by
+  `CLAIM_COMPARISON_CHUNK_DELAY_MS`, default 100ms, to leave SQL headroom for
+  live dashboards),
   `ai_analytics/sql_repository.py` (read-only queries),
   `ai_analytics_routes.py` (`/ai-analytics/claim-comparison`). Frontend:
   `components/ai/AiClaimComparisonDashboard.tsx`. Shared `KpiCard` and
