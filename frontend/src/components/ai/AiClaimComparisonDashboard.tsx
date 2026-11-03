@@ -69,8 +69,12 @@ const sectionTitleStyle: React.CSSProperties = {
 
 const pct = (value: number | null): string => (value === null ? '—' : formatPercent(value));
 
-const share = (count: number, total: number): string =>
-  total > 0 ? `${((count / total) * 100).toFixed(1)}%` : '—';
+// Shares are over the whole displayed population; `total` excludes
+// not-billable claims, so it is added back for the per-status shares.
+const share = (count: number, b: ClaimStatusBreakdown): string => {
+  const population = b.total + b.not_billable;
+  return population > 0 ? `${((count / population) * 100).toFixed(1)}%` : '—';
+};
 
 // Claims that finished the process — the rate denominator (paid + ready + denied).
 const finishedCount = (b: ClaimStatusBreakdown): number =>
@@ -114,7 +118,7 @@ const CohortStatusTable: React.FC<{ data: AiClaimComparisonResponse }> = ({ data
                   <td key={c.label} style={{ ...tdStyle, color: c.color }}>
                     {(c.breakdown[key] as number).toLocaleString()}{' '}
                     <span style={{ color: 'var(--text-muted)', fontSize: '11px' }}>
-                      ({share(c.breakdown[key] as number, c.breakdown.total)})
+                      ({share(c.breakdown[key] as number, c.breakdown)})
                     </span>
                   </td>
                 ))}

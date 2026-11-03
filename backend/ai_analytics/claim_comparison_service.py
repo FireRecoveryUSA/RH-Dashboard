@@ -61,6 +61,7 @@ from .claim_status_config import (
     BUCKET_PAID,
     BUCKET_READY_TO_BE_PAID,
     BUCKET_UNDER_REVIEW,
+    FINAL_BUCKETS,
     billing_target_from_statuses,
     billing_target_label,
     classify_claim_status,
@@ -83,8 +84,6 @@ COHORT_OTHER = "other"
 COHORT_AI_PENDING = "ai_pending"
 SUBTYPE_MANUAL = "manual"
 SUBTYPE_AI_REJECTED = "ai_rejected"
-
-FINAL_BUCKETS = (BUCKET_PAID, BUCKET_READY_TO_BE_PAID, BUCKET_DENIED)
 
 
 def _pct(numerator: int, denominator: int) -> Optional[float]:
