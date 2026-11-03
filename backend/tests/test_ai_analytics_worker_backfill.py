@@ -73,7 +73,7 @@ def seed_ai_line_items(ai_db, docs):
         for doc in docs:
             await ai_db["ai_line_items"].insert_one(doc)
 
-    _asyncio.get_event_loop().run_until_complete(_seed())
+    _asyncio.run(_seed())
 
 
 # ---------------------------------------------------------------------------
