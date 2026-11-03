@@ -213,6 +213,58 @@ const WeeklyTable: React.FC<{ weeks: ClaimComparisonWeek[] }> = ({ weeks }) => {
 };
 
 // ---------------------------------------------------------------------------
+// Incident outcome bar chart — paid/ready vs denied per incident type, AI vs other
+// ---------------------------------------------------------------------------
+
+const OutcomeBar: React.FC<{ breakdown: ClaimStatusBreakdown; label: string }> = ({ breakdown, label }) => {
+  const successes = breakdown.paid + breakdown.ready_to_be_paid;
+  const total = successes + breakdown.denied;
+  const successPct = total > 0 ? (successes / total) * 100 : 0;
+  return (
+    <div style={{ display: 'flex', alignItems: 'center', gap: '8px', margin: '3px 0' }}>
+      <span style={{ width: '52px', fontSize: '11px', color: 'var(--text-muted)', flexShrink: 0 }}>{label}</span>
+      <div style={{
+        flex: 1, display: 'flex', height: '18px', borderRadius: '4px', overflow: 'hidden',
+        background: 'var(--bg-secondary, rgba(128,128,128,0.15))',
+      }}>
+        {successPct > 0 && (
+          <div style={{ width: `${successPct}%`, background: '#22c55e' }} title={`Paid + ready: ${successes}`} />
+        )}
+        {total > 0 && successPct < 100 && (
+          <div style={{ width: `${100 - successPct}%`, background: '#ef4444' }} title={`Denied: ${breakdown.denied}`} />
+        )}
+      </div>
+      <span style={{ width: '110px', fontSize: '11px', flexShrink: 0, textAlign: 'right' }}>
+        {total > 0 ? `${pct(breakdown.paid_rate)} · ${total.toLocaleString()} claims` : 'no finished claims'}
+      </span>
+    </div>
+  );
+};
+
+const IncidentOutcomeChart: React.FC<{ segments: ClaimComparisonSegment[] }> = ({ segments }) => {
+  const rows = segments.filter((s) => s.overall.total > 0);
+  if (rows.length === 0) return null;
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: '14px', marginBottom: '18px' }}>
+      <div style={{ display: 'flex', gap: '16px', fontSize: '11px', color: 'var(--text-muted)' }}>
+        <span><span style={{ display: 'inline-block', width: '10px', height: '10px', background: '#22c55e', borderRadius: '2px', marginRight: '4px' }} />Paid + ready to be paid</span>
+        <span><span style={{ display: 'inline-block', width: '10px', height: '10px', background: '#ef4444', borderRadius: '2px', marginRight: '4px' }} />Denied</span>
+      </div>
+      {rows.map((s) => (
+        <div key={s.label}>
+          <div style={{ fontSize: '12px', fontWeight: 600, marginBottom: '2px' }}>{s.label}</div>
+          <OutcomeBar breakdown={s.ai_released} label="AI" />
+          <OutcomeBar breakdown={s.other} label="Other" />
+        </div>
+      ))}
+      <div style={{ fontSize: '11px', color: 'var(--text-muted)' }}>
+        Share of finished claims (paid + ready + denied); label shows paid rate and finished count. Other = manual + AI-rejected.
+      </div>
+    </div>
+  );
+};
+
+// ---------------------------------------------------------------------------
 // Segment tables (incident type, billing target)
 // ---------------------------------------------------------------------------
 
@@ -220,8 +272,10 @@ const SegmentTable: React.FC<{
   title: string;
   labelHeader: string;
   segments: ClaimComparisonSegment[];
-}> = ({ title, labelHeader, segments }) => (
+  chart?: React.ReactNode;
+}> = ({ title, labelHeader, segments, chart }) => (
   <SectionCard title={title}>
+    {chart}
     {segments.length === 0 ? (
       <EmptyState label="No claims in the selected period." />
     ) : (
@@ -547,7 +601,12 @@ export const AiClaimComparisonDashboard: React.FC = () => {
 
       <CohortStatusTable data={data} />
       <WeeklyTable weeks={data.weekly} />
-      <SegmentTable title="By Incident Type" labelHeader="Incident type" segments={data.by_incident_type} />
+      <SegmentTable
+        title="By Incident Type"
+        labelHeader="Incident type"
+        segments={data.by_incident_type}
+        chart={<IncidentOutcomeChart segments={data.by_incident_type} />}
+      />
       <SegmentTable title="By Billing Target" labelHeader="Billing target" segments={data.by_billing_target} />
       <NotBillableSection data={data} />
 

@@ -181,7 +181,7 @@ describe('AiClaimComparisonDashboard', () => {
   test('renders incident type and billing target sections', async () => {
     render(<AiClaimComparisonDashboard />);
     await waitFor(() => expect(screen.getByText('By Incident Type')).toBeInTheDocument());
-    expect(screen.getByText('Motor Vehicle Incident')).toBeInTheDocument();
+    expect(screen.getAllByText('Motor Vehicle Incident').length).toBeGreaterThanOrEqual(1);
     expect(screen.getByText('By Billing Target')).toBeInTheDocument();
     expect(screen.getByText('Insurance')).toBeInTheDocument();
   });
