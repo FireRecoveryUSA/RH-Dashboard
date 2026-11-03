@@ -31,7 +31,7 @@ import socket
 import time
 import uuid
 from collections import Counter, defaultdict
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 
 from .models import (
@@ -51,6 +51,7 @@ from . import sql_repository as sql_repo
 from .outcome_service import _load_normalized_cohort, iso_week_key
 from config import settings
 from .normalization_core import classify_billability
+from ai_analytics_worker.config import worker_config
 from ai_analytics_worker.leader_election import release_lease, try_acquire_lease
 from .claim_status_config import (
     BUCKET_ARCHIVE,
@@ -542,6 +543,12 @@ _WARM_HOLDER_ID = (
 )
 
 
+# Worker-state doc the lease holder publishes its completed result to, so
+# non-holder processes can prime their own in-memory caches without
+# running the history scan again.
+WARM_RESULT_DOC_ID = "comparison_warm_result"
+
+
 async def _warm_once(ai_db) -> None:
     """Recompute the default window and overwrite its cache entry.
 
@@ -552,14 +559,59 @@ async def _warm_once(ai_db) -> None:
     if not await try_acquire_lease(
         ai_db, WARM_RUN_LOCK_ID, _WARM_HOLDER_ID, _WARM_RUN_LEASE_SECONDS
     ):
-        logger.info(
-            "Claim comparison warm deferred; another worker is scanning"
-        )
+        # Another worker is scanning (or recently did): prime this process's
+        # cache from the published result instead of a second scan.
+        await _prime_from_shared_result(ai_db)
         return
     try:
         await _warm_once_uncached(ai_db)
-    finally:
+    except Exception:
         await release_lease(ai_db, WARM_RUN_LOCK_ID, _WARM_HOLDER_ID)
+        raise
+    else:
+        await release_lease(ai_db, WARM_RUN_LOCK_ID, _WARM_HOLDER_ID)
+    # CancelledError is not caught above: cancellation means the asyncio
+    # task is torn down while the asyncio.to_thread SQL read keeps running,
+    # so the lease must stay held and lapse on its own — releasing it now
+    # would let a peer start a second concurrent scan.
+
+
+async def _prime_from_shared_result(ai_db) -> None:
+    """Prime this process's cache from the result the lease holder published."""
+    try:
+        doc = await ai_db[worker_config.WORKER_STATE_COLLECTION].find_one(
+            {"_id": WARM_RESULT_DOC_ID}
+        )
+        if not doc or doc.get("value") is None:
+            logger.info(
+                "Claim comparison warm deferred; another worker is scanning "
+                "and no shared result exists yet"
+            )
+            return
+        computed_at = doc["computed_at"]
+        if computed_at.tzinfo is None:
+            computed_at = computed_at.replace(tzinfo=UTC)
+        age = (datetime.now(UTC) - computed_at).total_seconds()
+        if age >= CACHE_TTL_SECONDS:
+            logger.warning(
+                "Shared claim comparison result is stale (%ds old); skipping warm",
+                int(age),
+            )
+            return
+        start, end = await asyncio.to_thread(resolve_comparison_window, None)
+        filters = AiAnalyticsFilters(start_date=start, end_date=end,
+                                     department_id=None)
+        prime_cache(
+            "get_claim_payment_comparison",
+            (ai_db, filters),
+            {},
+            AiClaimComparisonResponse.model_validate(doc["value"]),
+            CACHE_TTL_SECONDS,
+            computed_at=computed_at.timestamp(),
+        )
+        logger.info("Claim comparison cache primed from shared result")
+    except Exception as e:
+        logger.warning(f"Shared claim comparison prime failed: {e}")
 
 
 async def _warm_once_uncached(ai_db) -> None:
@@ -596,6 +648,21 @@ async def _warm_once_uncached(ai_db) -> None:
         value,
         CACHE_TTL_SECONDS,
     )
+    # Publish so the other uvicorn workers can prime their own caches
+    # without rerunning the history scan.
+    try:
+        await ai_db[worker_config.WORKER_STATE_COLLECTION].replace_one(
+            {"_id": WARM_RESULT_DOC_ID},
+            {
+                "_id": WARM_RESULT_DOC_ID,
+                "computed_at": datetime.now(UTC),
+                "holder_id": _WARM_HOLDER_ID,
+                "value": value.model_dump(),
+            },
+            upsert=True,
+        )
+    except Exception as e:
+        logger.warning(f"Publishing shared claim comparison result failed: {e}")
 
 
 async def warm_claim_comparison_cache(
