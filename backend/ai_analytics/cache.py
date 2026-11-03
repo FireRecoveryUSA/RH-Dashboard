@@ -87,9 +87,13 @@ def cached(
                             f"AI analytics cache: keeping stale {name} entry over incomplete result"
                         )
                         # Bounded retry: serve the stale value for a short
-                        # window instead of recomputing on every request.
+                        # window instead of recomputing on every request —
+                        # never past the max stale age.
                         _cache[key] = (
-                            time.time() + _INCOMPLETE_RETRY_TTL,
+                            min(
+                                time.time() + _INCOMPLETE_RETRY_TTL,
+                                computed_at + _MAX_STALE_AGE,
+                            ),
                             value,
                             computed_at,
                         )
@@ -161,7 +165,13 @@ def touch_cache(
         or time.time() - entry[2] > _MAX_STALE_AGE
     ):
         return False
-    _cache[key] = (time.time() + ttl, entry[1], entry[2])
+    # Renewal never pushes expiry past the max stale age — the entry must
+    # lapse at the deadline so the next request surfaces the outage.
+    _cache[key] = (
+        min(time.time() + ttl, entry[2] + _MAX_STALE_AGE),
+        entry[1],
+        entry[2],
+    )
     return True
 
 

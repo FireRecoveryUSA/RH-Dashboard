@@ -677,6 +677,13 @@ class TestCacheWarmer:
                 computed_at=time_mod.time() - cache_mod._MAX_STALE_AGE - 1,
             )
             assert cache_mod.touch_cache("old", (), {}, ttl=3600) is False
+            # Near the deadline, a renewal is capped at it — stale totals can
+            # never outlive the max age via touches or retry renewals.
+            deadline = time_mod.time() - cache_mod._MAX_STALE_AGE + 30
+            cache_mod.prime_cache("edge", (), {}, "OK", ttl=-1, computed_at=deadline)
+            assert cache_mod.touch_cache("edge", (), {}, ttl=3600) is True
+            expires_at, _, _ = cache_mod._cache[list(cache_mod._cache)[-1]]
+            assert expires_at <= deadline + cache_mod._MAX_STALE_AGE + 1
             cache_mod.clear_cache()
 
     def test_status_versions_bound_rows_before_grouping(self):
