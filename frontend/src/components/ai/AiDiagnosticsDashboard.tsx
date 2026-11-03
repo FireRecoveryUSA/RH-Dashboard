@@ -24,33 +24,7 @@ import { AiAnalyticsFilterBar } from './AiAnalyticsFilterBar';
 import { useAutoRefresh } from '../../hooks/useAutoRefresh';
 import { useAiDateRange } from '../../hooks/useAiDateRange';
 import { SyncHealthIndicator } from './SyncHealthIndicator';
-
-// ---------------------------------------------------------------------------
-// KPI Card (shared with outcomes dashboard but duplicated for independence)
-// ---------------------------------------------------------------------------
-
-interface KpiCardProps {
-  label: string;
-  value: string | number;
-  icon: React.ReactNode;
-  color?: string;
-  subtitle?: string;
-}
-
-const KpiCard: React.FC<KpiCardProps> = ({ label, value, icon, color, subtitle }) => (
-  <div style={{ ...billingStyles.card, display: 'flex', flexDirection: 'column', gap: '8px', minHeight: '100px' }}>
-    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
-      <span style={{ fontSize: '11px', fontWeight: 600, color: 'var(--text-muted)', textTransform: 'uppercase' }}>
-        {label}
-      </span>
-      <span style={{ color: color || 'var(--accent-primary)' }}>{icon}</span>
-    </div>
-    <span style={{ fontSize: '28px', fontWeight: 700, color: color || 'var(--text-primary)' }}>
-      {value}
-    </span>
-    {subtitle && <span style={{ fontSize: '12px', color: 'var(--text-muted)' }}>{subtitle}</span>}
-  </div>
-);
+import { KpiCard, DataIncompleteBanner } from './AiDashboardPrimitives';
 
 // ---------------------------------------------------------------------------
 // Confidence calibration view
@@ -397,16 +371,7 @@ export const AiDiagnosticsDashboard: React.FC = () => {
       </div>
 
       {/* Data completeness warning */}
-      {!summary.data_complete && (
-        <div style={{
-          display: 'flex', alignItems: 'center', gap: '12px', padding: '12px 16px',
-          backgroundColor: 'rgba(234, 179, 8, 0.1)', border: '1px solid rgba(234, 179, 8, 0.2)',
-          borderRadius: 'var(--border-radius-md)', color: '#eab308', fontSize: '13px',
-        }}>
-          <AlertTriangle size={16} />
-          <span>Data may be incomplete. Source status: {Object.entries(summary.source_status).map(([k, v]) => `${k}=${v}`).join(', ')}</span>
-        </div>
-      )}
+      {!summary.data_complete && <DataIncompleteBanner sourceStatus={summary.source_status} />}
 
       {/* Confidence calibration + Status distribution */}
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '24px' }}>

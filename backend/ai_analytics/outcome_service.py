@@ -13,6 +13,7 @@ Follows the batch retrieval pattern from the plan (Section 28):
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from collections import Counter, defaultdict
@@ -257,8 +258,9 @@ async def _load_normalized_cohort(
     t_life = time.perf_counter()
     lifecycle_by_claim: Dict[int, Dict[str, Any]] = {}
     try:
-        lifecycle_by_claim = sql_repo.get_claim_lifecycle_for_claims(
-            [r["claim_id"] for r in normalized]
+        lifecycle_by_claim = await asyncio.to_thread(
+            sql_repo.get_claim_lifecycle_for_claims,
+            [r["claim_id"] for r in normalized],
         )
     except Exception as e:
         logger.error(f"SQL claim lifecycle query failed: {e}")
@@ -275,14 +277,18 @@ async def _load_normalized_cohort(
     t_sql = time.perf_counter()
     if grid_claim_ids:
         try:
-            cancellations_by_claim = sql_repo.get_cancellation_details_for_claims(grid_claim_ids)
+            cancellations_by_claim = await asyncio.to_thread(
+                sql_repo.get_cancellation_details_for_claims, grid_claim_ids
+            )
         except Exception as e:
             logger.error(f"SQL cancellation details query failed: {e}")
             cancellations_by_claim = {}
             source_status["recoveryhub_sql"] = "partial"
             data_complete = False
         try:
-            logs_by_claim = sql_repo.get_process_logs_for_claims(grid_claim_ids)
+            logs_by_claim = await asyncio.to_thread(
+                sql_repo.get_process_logs_for_claims, grid_claim_ids
+            )
         except Exception as e:
             logger.error(f"SQL process logs query failed: {e}")
             logs_by_claim = {}
@@ -773,6 +779,12 @@ async def get_outcome_funnel(
 # Trend
 # ---------------------------------------------------------------------------
 
+def iso_week_key(dt: datetime) -> str:
+    """ISO week label (``YYYY-Www``) shared by the weekly analytics series."""
+    iso_year, iso_week, _ = dt.isocalendar()
+    return f"{iso_year}-W{iso_week:02d}"
+
+
 async def get_outcome_trend(
     ai_db,
     filters: AiAnalyticsFilters,
@@ -811,9 +823,7 @@ async def get_outcome_trend(
             continue
 
         if grain == "week":
-            # ISO week
-            iso_year, iso_week, _ = dt.isocalendar()
-            key = f"{iso_year}-W{iso_week:02d}"
+            key = iso_week_key(dt)
         elif grain == "month":
             key = f"{dt.year}-{dt.month:02d}"
         else:

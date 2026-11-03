@@ -772,6 +772,92 @@ snapshot no longer gates any funnel stage or metric.
   qualified AI runs (`ai_record_state == "present"`);
   `did_not_qualify` counts only the definitive `not_configured` intake.
 
+## AI Claim Payment Comparison Dashboard
+
+Compares the **final payment result** of runs whose line items were created by
+AI and released from the AI grid (`ai_released`) against all other runs
+(`other`). `other` splits into `manual` (never went through the AI grid) and
+`ai_rejected` (went through the grid and was cancelled/rejected). Runs whose AI
+grid outcome is still pending or unknown are counted as `ai_pending` and
+excluded from every rate.
+
+- **Window**: fixed from Jan 1 of the SQL server's year (`resolve_comparison_window`)
+  through `end_date` (default today). Rural Metro departments
+  (`EXCLUDED_DEPARTMENT_IDS`) are excluded in SQL.
+- **Final state**: `Claims` is system-versioned (`ValidFrom` is the row-start column,
+  resolved from metadata). Status versions come from the current table plus
+  `AuditData.claimsHistory`, filtered by claim id only, in chunks of 2000. Never
+  use `FOR SYSTEM_TIME` here (history is 38.6M+ rows). The effective status is
+  the non-archive version with the latest row start. Archive versions are
+  ignored entirely. Effective date is that row start, used for weekly bucketing.
+- **Ties**: if two statuses share the latest row start, the live `Claims` row
+  wins (`is_current`). Without this the result depended on SQL row order. About
+  4,900 in-scope claims hit this case in production.
+- **Billing target** (per run, from the same status versions): **Direct** if the
+  latest direct status (`Invoiced Direct`, `Ready to Invoice Direct`) is later
+  than any insurance status (`Invoiced Insurance`, `Ready to Invoice Insurance`),
+  **Insurance** for the reverse, otherwise **Unknown**. `Departments.incidents_billing`
+  is not used (it is only 0/1).
+- **Incident type** (per run, same for AI and manual): `Claims.type_id` joined to
+  `dbo.run_types.type`. NULL type is "Unspecified". A type_id with no run_types
+  row is "Type {id}". AI `billing_category` is not used, since it is AI-only.
+- **Code**: `ai_analytics/claim_comparison_service.py` (service, cached 900s and
+  refreshed by a background warmer every `CLAIM_COMPARISON_WARM_INTERVAL_SECONDS`,
+  default 600s, so requests never hit the ~230s cold history read that exceeds
+  the 180s proxy timeout),
+  `ai_analytics/sql_repository.py` (read-only queries),
+  `ai_analytics_routes.py` (`/ai-analytics/claim-comparison`). Frontend:
+  `components/ai/AiClaimComparisonDashboard.tsx`. Shared `KpiCard` and
+  `DataIncompleteBanner` live in `AiDashboardPrimitives.tsx`.
+- **Worker**: unchanged. The AI side reads the existing projection through
+  `_load_normalized_cohort`, and the SQL side is request-time.
+
+### Status mapping: `ai_analytics/claim_status_config.py`
+
+`STATUS_BUCKETS` matches `Claims.status` by exact name, case-insensitively and
+trimmed. These names were confirmed against production:
+
+- archive (ignored): Review For Archives, Archived per FD, Archived Payment Plan
+- paid: Payment Received
+- ready_to_be_paid: Payment Approved, Confirm the Receipt of Invoice
+- denied: Denied, Denial Letter Review
+- under_review: Under Review
+- not_billable: Unbillable, Non-Billable (Insufficient Information)
+- in_progress (known, mapped): Sent To Collections, On Hold, Invoiced Direct,
+  Invoiced Insurance, Follow Up, Resident, Requesting Information, Unassigned,
+  Assigned, Payment Plan, Ready to Invoice Insurance, Ready to Invoice Direct,
+  Ready for Collections, RM Pending Action, False Alarms, False Alarm Below
+  Threshold, Invalid Address, Law Office, Uncollectable by Law Office
+
+Any other status falls back to `in_progress` and is reported in
+`unmapped_statuses` and as `mapped: false` by schema-check. Known gap: history
+contains **Assigned Inactive Users** (1 row, Jan 1 to Nov 3 2026). It is not
+mapped yet and currently counts as in progress.
+
+### Schema check
+
+`GET /ai-analytics/claim-comparison/schema-check` returns the distinct in-scope
+`Claims.status` values with counts, bucket, and mapped flag. It also returns
+`Claims.type_id` values with counts and incident-type labels, the resolved
+row-start column, and the `claims_deleted` column list. Use it to verify the
+mapping whenever statuses change.
+
+### Verified against production (2026-11-03, dev backend container)
+
+Run from inside `rh-dashboard-backend-dev` via `docker exec` (SQL is not
+reachable from the host). Warm, deterministic (two identical runs), 22,009
+compared runs, 38,829 in-scope runs:
+
+- Comparison wall-clock: about 57 to 60 s warm. The first request after an idle
+  period took 230 s, with 170 s on the first history chunk. Warm history queries
+  took 3.4 to 5.4 s per chunk over 12 chunks. Scope query 1.3 s, deleted-runs
+  query 0.9 s. The rest is the AI-side load. Schema check is about 2.5 s.
+- Overall paid rate 36.77%, resolved success 76.20%, denied 23.80%.
+  AI-released paid 33.89% (2,771 claims). Other paid 37.25% (19,238 claims),
+  split manual 37.24% and AI-rejected 37.27%.
+- AI pending excluded: 16,820. Deleted runs: 106. Unresolved claims: 0.
+- Not billable: 4,882 runs marked by processor. Identified by system: 0.
+
 ## AI Outcomes Dashboard — funnel-cleanup merge (2026-10-12, PR #44)
 
 `main-work/ai-funnel-cleanup` (projection-first Mongo cohort,

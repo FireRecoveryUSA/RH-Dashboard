@@ -18,13 +18,14 @@ import {
   Sparkles,
   Zap,
   Activity,
-  LucideIcon
+  LucideIcon,
+  GitCompareArrows,
 } from 'lucide-react';
 import { Dashboard } from '../services/api';
 import { BillingView } from './billing/types';
 import { WorkerToggle } from './ai/WorkerToggle';
 
-export type AiAnalyticsView = 'adoption' | 'outcomes' | 'diagnostics';
+export type AiAnalyticsView = 'adoption' | 'outcomes' | 'claim-comparison' | 'diagnostics';
 
 interface BillingSidebarItem {
   id: BillingView;
@@ -51,6 +52,7 @@ interface AiAnalyticsNavItem {
 const AI_ANALYTICS_NAV_ITEMS: AiAnalyticsNavItem[] = [
   { id: 'adoption',    label: 'AI Adoption',     icon: Zap },
   { id: 'outcomes',    label: 'AI Outcomes',     icon: TrendingUp },
+  { id: 'claim-comparison', label: 'Claim Payment Comparison', icon: GitCompareArrows },
   { id: 'diagnostics', label: 'AI Diagnostics',  icon: Activity },
 ];
 

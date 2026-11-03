@@ -5,6 +5,7 @@ All endpoints are read-only and require authentication via ``get_current_user``.
 
 from __future__ import annotations
 
+import asyncio
 import functools
 import logging
 from typing import Any, Callable, List, Optional
@@ -44,7 +45,12 @@ from ai_analytics.diagnostics_service import (
     get_agent_stats,
 )
 from ai_analytics.invoice_trace_service import get_invoice_trace
-from ai_analytics.models import AiInvoiceTrace
+from ai_analytics.models import AiInvoiceTrace, AiClaimComparisonResponse, AiClaimComparisonSchemaCheck
+from ai_analytics.claim_comparison_service import (
+    get_claim_payment_comparison,
+    get_claim_comparison_schema_check,
+    resolve_comparison_window,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -552,6 +558,49 @@ async def diagnostics_agents(
         1, 1, "ai_business_updated_at", "desc", "business_status_date",
     )
     return await get_agent_stats(ai_db, filters)
+
+
+# ---------------------------------------------------------------------------
+# Claim payment comparison
+# ---------------------------------------------------------------------------
+
+@ai_analytics_router.get(
+    "/claim-comparison",
+    response_model=AiClaimComparisonResponse,
+    dependencies=[Depends(get_current_user)],
+)
+@_handle_route_errors("build claim payment comparison")
+async def claim_payment_comparison(
+    end_date: Optional[str] = _Q_END_DATE,
+    department_id: Optional[int] = _Q_DEPT_ID,
+    ai_db=Depends(get_ai_db),
+):
+    """Final payment outcome of AI-released vs other runs, year to date."""
+    start_date, resolved_end = await asyncio.to_thread(
+        resolve_comparison_window, end_date
+    )
+    filters = AiAnalyticsFilters(
+        start_date=start_date,
+        end_date=resolved_end,
+        department_id=department_id,
+    )
+    return await get_claim_payment_comparison(ai_db, filters)
+
+
+@ai_analytics_router.get(
+    "/claim-comparison/schema-check",
+    response_model=AiClaimComparisonSchemaCheck,
+    dependencies=[Depends(get_current_user)],
+)
+@_handle_route_errors("build claim comparison schema check")
+async def claim_comparison_schema_check(
+    end_date: Optional[str] = _Q_END_DATE,
+):
+    """Raw status, billing-mode and incident-column values behind the config."""
+    start_date, resolved_end = await asyncio.to_thread(
+        resolve_comparison_window, end_date
+    )
+    return await get_claim_comparison_schema_check(start_date, resolved_end)
 
 
 # ---------------------------------------------------------------------------

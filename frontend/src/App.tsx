@@ -15,6 +15,7 @@ import { ReservationDashboard } from './components/billing/ReservationDashboard'
 import { AICostAnalyst } from './components/billing/AICostAnalyst';
 import { AiAdoptionDashboard } from './components/ai/AiAdoptionDashboard';
 import { AiOutcomesDashboard } from './components/ai/AiOutcomesDashboard';
+import { AiClaimComparisonDashboard } from './components/ai/AiClaimComparisonDashboard';
 import { AiDiagnosticsDashboard } from './components/ai/AiDiagnosticsDashboard';
 import { AiAnalyticsView } from './components/Sidebar';
 import { 
@@ -281,6 +282,10 @@ export const AppContent: React.FC = () => {
       title: 'AI Outcomes & Success',
       description: 'Track AI invoice lifecycle outcomes, release rates, rejection reasons, and billability evaluation.',
     },
+    'claim-comparison': {
+      title: 'Claim Payment Comparison',
+      description: 'Compare final payment results of AI-released runs against all other runs, by week, incident type, billing target, and not-billable status.',
+    },
     diagnostics: {
       title: 'AI Diagnostics',
       description: 'Monitor AI execution health, confidence calibration, retry patterns, writeback failures, and agent stats.',
@@ -357,6 +362,8 @@ export const AppContent: React.FC = () => {
             <AiAdoptionDashboard />
           ) : activeAiAnalyticsView === 'outcomes' ? (
             <AiOutcomesDashboard />
+          ) : activeAiAnalyticsView === 'claim-comparison' ? (
+            <AiClaimComparisonDashboard />
           ) : activeAiAnalyticsView === 'diagnostics' ? (
             <AiDiagnosticsDashboard />
           ) : activeBillingView ? (
