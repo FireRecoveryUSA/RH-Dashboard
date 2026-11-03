@@ -615,6 +615,29 @@ class TestCacheWarmer:
             assert len(calls) == 1
             cache_mod.clear_cache()
 
+    def test_cache_returns_incomplete_after_max_stale_age(self):
+        import time as time_mod
+        from ai_analytics import cache as cache_mod
+        calls = []
+
+        @cache_mod.cached(ttl=60, func_name="probe3")
+        async def probe3():
+            calls.append(1)
+            return SimpleNamespace(data_complete=False, n=len(calls))
+
+        with patch.object(cache_mod, "_is_testing", return_value=False):
+            cache_mod.clear_cache()
+            # Good value computed long ago, already past the max stale age
+            cache_mod.prime_cache(
+                "probe3", (), {}, "OLD", ttl=-1,
+                computed_at=time_mod.time() - cache_mod._MAX_STALE_AGE - 1,
+            )
+            result = asyncio.run(probe3())
+            # Fresh incomplete result surfaces the outage, not the stale value
+            assert result.data_complete is False
+            assert result.n == 1
+            cache_mod.clear_cache()
+
     def test_cache_does_not_store_incomplete_result(self):
         from ai_analytics import cache as cache_mod
         calls = []
@@ -639,7 +662,7 @@ class TestCacheWarmer:
             cache_mod.clear_cache()
             cache_mod.prime_cache("probe", (1,), {}, "GOOD", ttl=-1)
             assert cache_mod.touch_cache("probe", (1,), {}, ttl=3600) is True
-            expires_at, value = cache_mod._cache[list(cache_mod._cache)[0]]
+            expires_at, value, _ = cache_mod._cache[list(cache_mod._cache)[0]]
             assert value == "GOOD"
             assert expires_at > 0
             assert cache_mod.touch_cache("missing", (1,), {}, ttl=60) is False
@@ -647,6 +670,13 @@ class TestCacheWarmer:
             # requests retry the source.
             cache_mod.prime_cache("bad", (), {}, SimpleNamespace(data_complete=False), ttl=60)
             assert cache_mod.touch_cache("bad", (), {}, ttl=3600) is False
+            # A complete value older than the max stale age is not renewed
+            import time as time_mod
+            cache_mod.prime_cache(
+                "old", (), {}, "OLD", ttl=-1,
+                computed_at=time_mod.time() - cache_mod._MAX_STALE_AGE - 1,
+            )
+            assert cache_mod.touch_cache("old", (), {}, ttl=3600) is False
             cache_mod.clear_cache()
 
     def test_status_versions_bound_rows_before_grouping(self):
