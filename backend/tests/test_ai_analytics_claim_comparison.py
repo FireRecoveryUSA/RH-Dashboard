@@ -98,21 +98,34 @@ class TestClassifyClaimStatus:
 
 class TestBillingTarget:
     def test_direct_only(self):
-        assert billing_target_from_statuses([("Invoiced Direct", 1)]) == BILLING_TARGET_DIRECT
+        assert billing_target_from_statuses([("Invoiced Direct", 1, True)]) == BILLING_TARGET_DIRECT
 
     def test_insurance_only(self):
-        assert billing_target_from_statuses([("Ready to Invoice Insurance", 1)]) == BILLING_TARGET_INSURANCE
+        assert billing_target_from_statuses([("Ready to Invoice Insurance", 1, True)]) == BILLING_TARGET_INSURANCE
 
     def test_neither_is_unknown(self):
-        assert billing_target_from_statuses([("Denied", 1)]) == BILLING_TARGET_UNKNOWN
+        assert billing_target_from_statuses([("Denied", 1, True)]) == BILLING_TARGET_UNKNOWN
         assert billing_target_from_statuses([]) == BILLING_TARGET_UNKNOWN
 
     def test_both_uses_latest(self):
         assert billing_target_from_statuses(
-            [("Invoiced Insurance", 1), ("Invoiced Direct", 2)]
+            [("Invoiced Insurance", 1, True), ("Invoiced Direct", 2, False)]
         ) == BILLING_TARGET_DIRECT
         assert billing_target_from_statuses(
-            [("Invoiced Direct", 1), ("Invoiced Insurance", 2)]
+            [("Invoiced Direct", 1, True), ("Invoiced Insurance", 2, False)]
+        ) == BILLING_TARGET_INSURANCE
+
+    def test_tie_prefers_current_row(self):
+        # Timestamp tie: the live Claims row's status wins, whichever side it is
+        assert billing_target_from_statuses(
+            [("Invoiced Direct", 2, True), ("Invoiced Insurance", 2, False)]
+        ) == BILLING_TARGET_DIRECT
+        assert billing_target_from_statuses(
+            [("Invoiced Direct", 2, False), ("Invoiced Insurance", 2, True)]
+        ) == BILLING_TARGET_INSURANCE
+        # Neither current -> deterministic insurance fallback
+        assert billing_target_from_statuses(
+            [("Invoiced Direct", 2, False), ("Invoiced Insurance", 2, False)]
         ) == BILLING_TARGET_INSURANCE
 
     def test_labels(self):

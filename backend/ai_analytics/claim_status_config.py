@@ -123,30 +123,40 @@ def classify_claim_status(status: Optional[str]) -> str:
 
 
 def billing_target_from_statuses(
-    versions: Iterable[Tuple[Optional[str], object]],
+    versions: Iterable[Tuple[Optional[str], object, bool]],
 ) -> str:
-    """Billing target from (status, last_start) pairs for one claim.
+    """Billing target from (status, last_start, is_current) triples for one claim.
 
-    The direct or insurance status with the latest last_start wins. Without
-    either, the target is unknown. ``last_start`` only needs to be orderable.
+    The direct or insurance status with the latest last_start wins; on a tie,
+    the version on the live Claims row wins (it is the authoritative current
+    state — same rule effective-status ties use). Without either, the target
+    is unknown. ``last_start`` only needs to be orderable.
     """
     latest_direct = None
     latest_insurance = None
-    for status, last_start in versions:
+    for status, last_start, is_current in versions:
         name = _normalize(status)
+        candidate = (last_start, bool(is_current))
         if name in DIRECT_BILLING_STATUSES:
-            if latest_direct is None or last_start > latest_direct:
-                latest_direct = last_start
+            if latest_direct is None or candidate > latest_direct:
+                latest_direct = candidate
         elif name in INSURANCE_BILLING_STATUSES:
-            if latest_insurance is None or last_start > latest_insurance:
-                latest_insurance = last_start
+            if latest_insurance is None or candidate > latest_insurance:
+                latest_insurance = candidate
     if latest_direct is None and latest_insurance is None:
         return BILLING_TARGET_UNKNOWN
     if latest_insurance is None:
         return BILLING_TARGET_DIRECT
     if latest_direct is None:
         return BILLING_TARGET_INSURANCE
-    return BILLING_TARGET_DIRECT if latest_direct > latest_insurance else BILLING_TARGET_INSURANCE
+    # Latest wins; on a timestamp tie the current row decides, else insurance.
+    if latest_direct[0] > latest_insurance[0]:
+        return BILLING_TARGET_DIRECT
+    if latest_insurance[0] > latest_direct[0]:
+        return BILLING_TARGET_INSURANCE
+    if latest_direct[1] != latest_insurance[1]:
+        return BILLING_TARGET_DIRECT if latest_direct[1] else BILLING_TARGET_INSURANCE
+    return BILLING_TARGET_INSURANCE
 
 
 def billing_target_label(target: str) -> str:

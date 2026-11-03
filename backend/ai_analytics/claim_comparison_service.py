@@ -477,8 +477,8 @@ async def _compute_claim_payment_comparison(
             ),
             incident=incident_type_label(row.get("type_id"), row.get("type_name")),
             billing_target=billing_target_from_statuses(
-                (status, last_start)
-                for status, _, last_start, _ in claim_versions
+                (status, last_start, is_current)
+                for status, _, last_start, is_current in claim_versions
                 if last_start < as_of
             ),
             system_not_billable=bool(system_not_billable),
