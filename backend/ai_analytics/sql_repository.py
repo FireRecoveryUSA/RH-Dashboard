@@ -701,11 +701,17 @@ def get_deleted_runs_count(
 def get_claim_status_versions(
     claim_ids: List[int],
     row_start_column: str,
+    as_of: Optional[Any] = None,
 ) -> List[Dict[str, Any]]:
     """Distinct (status) versions per claim across current and history rows.
 
     History is filtered by claim id only. Never use FOR SYSTEM_TIME here:
     AuditData.claimsHistory is 38.6M+ rows.
+
+    ``as_of`` bounds each current/history row *before* the GROUP BY — without
+    it, a status that recurs after the cutoff would collapse to its post-cutoff
+    MAX(row_start) and drop out of a past window entirely, hiding the earlier
+    in-window occurrence that was the claim's real state at the cutoff.
     """
     if not claim_ids:
         return []
@@ -724,13 +730,17 @@ def get_claim_status_versions(
         WHERE c.id IN (
             SELECT CAST(value AS int) FROM STRING_SPLIT(CAST(%(claim_ids_csv)s AS nvarchar(max)), ',')
         )
+          AND (%(as_of)s IS NULL OR c.{row_start} < %(as_of)s)
         UNION ALL
         SELECT h.id, h.status, h.{row_start} AS row_start, CAST(0 AS int) AS is_current
         FROM AuditData.claimsHistory h
         WHERE h.id IN (
             SELECT CAST(value AS int) FROM STRING_SPLIT(CAST(%(claim_ids_csv)s AS nvarchar(max)), ',')
         )
+          AND (%(as_of)s IS NULL OR h.{row_start} < %(as_of)s)
     ) x
     GROUP BY x.id, x.status
     """
-    return _execute_parameterized(query, {"claim_ids_csv": claim_ids_csv})
+    return _execute_parameterized(
+        query, {"claim_ids_csv": claim_ids_csv, "as_of": as_of}
+    )

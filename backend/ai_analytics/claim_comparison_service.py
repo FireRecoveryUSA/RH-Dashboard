@@ -160,7 +160,7 @@ def _fetch_status_versions(
     versions: Dict[int, List[Tuple[str, str, datetime, bool]]] = defaultdict(list)
     unmapped: Counter = Counter()
     for chunk in _chunks(claim_ids, HISTORY_CHUNK_SIZE):
-        for row in sql_repo.get_claim_status_versions(chunk, row_start_column):
+        for row in sql_repo.get_claim_status_versions(chunk, row_start_column, as_of):
             claim_id = row.get("id")
             last_start = row.get("last_start")
             if claim_id is None or not last_start:
@@ -526,6 +526,14 @@ async def _warm_once(ai_db) -> None:
         department_id=None,
     )
     value = await _compute_claim_payment_comparison(ai_db, filters)
+    if not value.data_complete:
+        # Don't overwrite the last good entry with an empty result from a
+        # transient outage — requests would see an empty dashboard until the
+        # next successful warm. Keep the stale entry (or none) instead.
+        logger.warning(
+            "Claim comparison warm produced an incomplete result; keeping previous cache entry"
+        )
+        return
     prime_cache(
         "get_claim_payment_comparison",
         (ai_db, filters),
