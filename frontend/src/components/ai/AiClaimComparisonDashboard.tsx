@@ -218,7 +218,7 @@ const WeeklyTable: React.FC<{ weeks: ClaimComparisonWeek[] }> = ({ weeks }) => {
 
 const OutcomeBar: React.FC<{ breakdown: ClaimStatusBreakdown; label: string }> = ({ breakdown, label }) => {
   const successes = breakdown.paid + breakdown.ready_to_be_paid;
-  const total = successes + breakdown.denied;
+  const total = finishedCount(breakdown);
   const successPct = total > 0 ? (successes / total) * 100 : 0;
   return (
     <div style={{ display: 'flex', alignItems: 'center', gap: '8px', margin: '3px 0' }}>
