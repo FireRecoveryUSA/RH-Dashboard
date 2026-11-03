@@ -27,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 from collections import Counter, defaultdict
 from datetime import date, datetime, timedelta
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
@@ -69,10 +70,10 @@ logger = logging.getLogger(__name__)
 
 HISTORY_CHUNK_SIZE = 2000
 
-# Cache TTL is longer than the default warm interval so a request between two
-# warm runs still hits the cache instead of recomputing against a cold SQL
-# buffer cache (a cold history read exceeds the proxy's 180s timeout).
-CACHE_TTL_SECONDS = 900
+# Cache TTL must exceed the warm interval plus a margin for the warm compute
+# itself (~230s cold), or requests between warms would recompute against a
+# cold SQL buffer cache (exceeding the proxy's 180s timeout).
+CACHE_TTL_SECONDS = 3600
 
 COHORT_AI_RELEASED = "ai_released"
 COHORT_OTHER = "other"
@@ -159,7 +160,8 @@ def _fetch_status_versions(
     """
     versions: Dict[int, List[Tuple[str, str, datetime, bool]]] = defaultdict(list)
     unmapped: Counter = Counter()
-    for chunk in _chunks(claim_ids, HISTORY_CHUNK_SIZE):
+    chunks = list(_chunks(claim_ids, HISTORY_CHUNK_SIZE))
+    for i, chunk in enumerate(chunks):
         for row in sql_repo.get_claim_status_versions(chunk, row_start_column, as_of):
             claim_id = row.get("id")
             last_start = row.get("last_start")
@@ -176,6 +178,10 @@ def _fetch_status_versions(
                 last_start_dt,
                 bool(row.get("is_current")),
             ))
+        # Pace chunk reads so a full history scan can't starve the shared
+        # Azure SQL (other dashboards' queries interleave between chunks).
+        if i < len(chunks) - 1:
+            time.sleep(_chunk_delay_seconds())
     return versions, unmapped
 
 
@@ -502,14 +508,23 @@ async def get_claim_payment_comparison(
     return await _compute_claim_payment_comparison(ai_db, filters)
 
 
+def _chunk_delay_seconds() -> float:
+    """Yield between chunked history reads; CLAIM_COMPARISON_CHUNK_DELAY_MS, default 100."""
+    try:
+        return max(0.0, float(os.environ.get("CLAIM_COMPARISON_CHUNK_DELAY_MS", "100")) / 1000)
+    except ValueError:
+        logger.warning("Invalid CLAIM_COMPARISON_CHUNK_DELAY_MS; using 100")
+        return 0.1
+
+
 def _warm_interval_seconds() -> int:
     try:
-        return int(os.environ.get("CLAIM_COMPARISON_WARM_INTERVAL_SECONDS", "600"))
+        return int(os.environ.get("CLAIM_COMPARISON_WARM_INTERVAL_SECONDS", "1800"))
     except ValueError:
         logger.warning(
-            "Invalid CLAIM_COMPARISON_WARM_INTERVAL_SECONDS; using 600"
+            "Invalid CLAIM_COMPARISON_WARM_INTERVAL_SECONDS; using 1800"
         )
-        return 600
+        return 1800
 
 
 async def _warm_once(ai_db) -> None:

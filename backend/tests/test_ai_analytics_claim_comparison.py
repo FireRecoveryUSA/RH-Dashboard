@@ -566,13 +566,31 @@ class TestChunkingAndSql:
 # ---------------------------------------------------------------------------
 
 class TestCacheWarmer:
-    def test_warm_interval_defaults_to_600(self, monkeypatch):
+    def test_warm_interval_defaults_to_1800(self, monkeypatch):
         monkeypatch.delenv("CLAIM_COMPARISON_WARM_INTERVAL_SECONDS", raising=False)
-        assert svc._warm_interval_seconds() == 600
+        assert svc._warm_interval_seconds() == 1800
 
     def test_warm_interval_invalid_value_falls_back(self, monkeypatch):
         monkeypatch.setenv("CLAIM_COMPARISON_WARM_INTERVAL_SECONDS", "bogus")
-        assert svc._warm_interval_seconds() == 600
+        assert svc._warm_interval_seconds() == 1800
+
+    def test_chunk_delay_defaults_to_100ms(self, monkeypatch):
+        monkeypatch.delenv("CLAIM_COMPARISON_CHUNK_DELAY_MS", raising=False)
+        assert svc._chunk_delay_seconds() == 0.1
+
+    def test_chunk_delay_invalid_value_falls_back(self, monkeypatch):
+        monkeypatch.setenv("CLAIM_COMPARISON_CHUNK_DELAY_MS", "bogus")
+        assert svc._chunk_delay_seconds() == 0.1
+
+    def test_status_version_chunks_are_paced(self, monkeypatch):
+        monkeypatch.setenv("CLAIM_COMPARISON_CHUNK_DELAY_MS", "50")
+        with patch(f"{SERVICE}._chunks",
+                   side_effect=lambda items, size: [items[:1], items[1:]]), \
+             patch(f"{SQL}.get_claim_status_versions", return_value=[]), \
+             patch(f"{SERVICE}.time.sleep") as sleep:
+            svc._fetch_status_versions([1, 2], ROW_START)
+        # Two chunks -> one inter-chunk yield of 50ms
+        sleep.assert_called_once_with(0.05)
 
     def test_warm_interval_zero_disables_warmer(self, monkeypatch):
         monkeypatch.setenv("CLAIM_COMPARISON_WARM_INTERVAL_SECONDS", "0")
