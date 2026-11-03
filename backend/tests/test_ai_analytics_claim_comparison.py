@@ -547,14 +547,15 @@ class TestChunkingAndSql:
 
     def test_scope_query_excludes_rural_metro_and_joins_run_types(self):
         with patch(f"{SQL}._execute_parameterized", return_value=[]) as execute:
-            sql_repo.get_claim_comparison_scope("2026-01-01", "2026-06-30", None, ROW_START, None)
+            sql_repo.get_claim_comparison_scope("2026-01-01", "2026-06-30", None, ROW_START, None, None)
         query, _ = execute.call_args.args
         assert "NOT IN (1136,2198,2627,2628,2629)" in query
         assert "c.submitted = 1" in query
         # Candidates include claims with status activity at/after the window
-        # start, regardless of submission date.
+        # start, regardless of submission date — bounded on both ends.
         assert "AuditData.claimsHistory" in query
         assert "%(start_utc)s" in query
+        assert "%(end_utc)s" in query
         assert "c.original_run_id IS NOT NULL" in query
         assert "LEFT JOIN dbo.run_types rt ON rt.id = c.type_id" in query
         assert "incidents_billing" not in query

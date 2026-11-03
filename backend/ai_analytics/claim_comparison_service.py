@@ -51,6 +51,7 @@ from . import sql_repository as sql_repo
 from .outcome_service import _load_normalized_cohort, iso_week_key
 from config import settings
 from .normalization_core import classify_billability
+from ai_adoption_service import EXCLUDED_DEPARTMENT_IDS
 from ai_analytics_worker.config import worker_config
 from ai_analytics_worker.leader_election import release_lease, try_acquire_lease
 from .claim_status_config import (
@@ -161,17 +162,14 @@ def _fetch_status_versions(
     claim_ids: List[int],
     row_start_column: str,
     as_of: Optional[datetime] = None,
-) -> Tuple[Dict[int, List[Tuple[str, str, datetime, bool, datetime]]], Counter]:
-    """(status, bucket, last_start, is_current, first_start) versions per claim,
-    plus unmapped status counts.
+) -> Dict[int, List[Tuple[str, str, datetime, bool, datetime]]]:
+    """(status, bucket, last_start, is_current, first_start) versions per claim.
 
-    ``row_start`` values are UTC (the temporal AS_ROW_START column). Unmapped
-    raw statuses are only counted for versions before ``as_of`` so a past
-    window never reports post-window values. ``first_start`` is the earliest
-    occurrence of that status — used to date when a claim entered the process.
+    ``row_start`` values are UTC (the temporal AS_ROW_START column).
+    ``first_start`` is the earliest occurrence of that status — used to date
+    when a claim entered the process.
     """
     versions: Dict[int, List[Tuple[str, str, datetime, bool, datetime]]] = defaultdict(list)
-    unmapped: Counter = Counter()
     chunks = list(_chunks(claim_ids, HISTORY_CHUNK_SIZE))
     for i, chunk in enumerate(chunks):
         for row in sql_repo.get_claim_status_versions(chunk, row_start_column, as_of):
@@ -182,9 +180,6 @@ def _fetch_status_versions(
             last_start_dt = _parse_ts(last_start)
             first_start_dt = _parse_ts(row.get("first_start") or last_start)
             status = row.get("status")
-            if not is_mapped_claim_status(status):
-                if as_of is None or last_start_dt < as_of:
-                    unmapped[status or "(null)"] += 1
             versions[int(claim_id)].append((
                 status,
                 classify_claim_status(status),
@@ -196,7 +191,7 @@ def _fetch_status_versions(
         # Azure SQL (other dashboards' queries interleave between chunks).
         if i < len(chunks) - 1:
             time.sleep(_chunk_delay_seconds())
-    return versions, unmapped
+    return versions
 
 
 def _process_entry_local_date(
@@ -443,6 +438,9 @@ async def _compute_claim_payment_comparison(
             row_start_column,
             datetime(start.year, start.month, start.day)
             - timedelta(hours=settings.AI_LOCAL_UTC_OFFSET_HOURS),
+            datetime(end.year, end.month, end.day)
+            + timedelta(days=1)
+            - timedelta(hours=settings.AI_LOCAL_UTC_OFFSET_HOURS),
         )
     except Exception as e:
         logger.error(f"Claim comparison SQL scope query failed: {e}")
@@ -466,7 +464,10 @@ async def _compute_claim_payment_comparison(
             "Claim comparison AI cohort unavailable; returning incomplete result"
         )
         return _empty_result(start, end, source_status)
-    ai_by_claim = {int(r["claim_id"]): r for r in records if r.get("claim_id")}
+    ai_by_claim = {
+        int(r["claim_id"]): r for r in records
+        if r.get("claim_id") and r.get("department_id") not in EXCLUDED_DEPARTMENT_IDS
+    }
 
     # Candidates = SQL scope rows ∪ AI-cohort claims. An AI-processed claim
     # qualifies on its ai_inserted_at alone — submission date is irrelevant.
@@ -483,7 +484,7 @@ async def _compute_claim_payment_comparison(
     as_of = as_of_local - local_offset
 
     try:
-        versions, unmapped = await asyncio.to_thread(
+        versions = await asyncio.to_thread(
             _fetch_status_versions,
             sorted(candidate_ids),
             row_start_column,
@@ -512,6 +513,15 @@ async def _compute_claim_payment_comparison(
             ai_pending += 1
             continue
         tracked.append((claim_id, cohort, subtype, record, row))
+
+    # Unmapped statuses are only reported for claims that survived the
+    # entry-date gate — a claim outside the payload must not produce a
+    # status warning.
+    unmapped: Counter = Counter()
+    for claim_id, _c, _st, _r, _row in tracked:
+        for status, _b, last_start, _cur, _fs in versions.get(claim_id, []):
+            if not is_mapped_claim_status(status) and last_start < as_of:
+                unmapped[status or "(null)"] += 1
 
     deleted_runs = 0
     try:
@@ -544,7 +554,11 @@ async def _compute_claim_payment_comparison(
                 for _, b, row_start, _, _fs in claim_versions
                 if row_start < as_of
             ),
-            incident=incident_type_label(row.get("type_id"), row.get("type_name")),
+            incident=incident_type_label(
+                row.get("type_id") if row.get("type_id") is not None
+                else (record or {}).get("run_type_id"),
+                row.get("type_name"),
+            ),
             billing_target=billing_target_from_statuses(
                 (status, last_start, is_current)
                 for status, _, last_start, is_current, _fs in claim_versions

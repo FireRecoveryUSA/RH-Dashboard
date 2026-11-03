@@ -612,6 +612,7 @@ def get_claim_comparison_scope(
     department_id: Optional[int],
     row_start_column: str,
     start_utc: Any,
+    end_utc: Any,
 ) -> List[Dict[str, Any]]:
     """Candidate runs for the claim comparison, excluding Rural Metro.
 
@@ -641,10 +642,10 @@ def get_claim_comparison_scope(
       AND (c.dept_id IS NULL OR c.dept_id NOT IN ({_EXCLUDED_DEPT_SQL}))
       AND (
         c.date_of_submitted >= %(start_date)s
-        OR c.{row_start} >= %(start_utc)s
+        OR (c.{row_start} >= %(start_utc)s AND c.{row_start} < %(end_utc)s)
         OR c.id IN (
             SELECT h.id FROM AuditData.claimsHistory h
-            WHERE h.{row_start} >= %(start_utc)s
+            WHERE h.{row_start} >= %(start_utc)s AND h.{row_start} < %(end_utc)s
         )
       )
     """
@@ -655,6 +656,7 @@ def get_claim_comparison_scope(
             "end_date": end_date,
             "department_id": department_id,
             "start_utc": start_utc,
+            "end_utc": end_utc,
         },
     )
 
