@@ -397,7 +397,25 @@ class TestWeeklyAndRates:
         resp = _run(scope, rows, deleted=3)
         assert resp.deleted_runs == 3
         assert resp.overall.total == 2
-        assert resp.overall.paid_rate == 50.0
+        # Rate denominator is finished claims only (paid + ready + denied);
+        # the under-review claim counts toward total, not the rate.
+        assert resp.overall.paid_rate == 100.0
+
+    def test_rate_denominator_is_finished_claims_only(self):
+        scope = [_scope_row(i) for i in range(1, 5)]
+        rows = (
+            _versions(1, ("Payment Received", "2026-02-10T10:00:00"))
+            + _versions(2, ("Denied", "2026-02-10T10:00:00"))
+            + _versions(3, ("Under Review", "2026-02-10T10:00:00"))
+            + _versions(4, ("Unbillable", "2026-02-10T10:00:00"))
+        )
+        resp = _run(scope, rows)
+        # Not-billable is excluded from the total; in-flight statuses count
+        # toward it but not toward rate denominators.
+        assert resp.overall.total == 3
+        assert resp.overall.not_billable == 1
+        assert resp.overall.paid_rate == 50.0  # (paid+ready)/(paid+ready+denied)
+        assert resp.overall.denied_rate == 50.0
 
     def test_zero_denominators_return_none(self):
         resp = _run([_scope_row(1)], _versions(1, ("Unbillable", "2026-02-10T10:00:00")))

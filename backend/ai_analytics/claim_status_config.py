@@ -24,14 +24,14 @@ BUCKET_READY_TO_BE_PAID = "ready_to_be_paid"
 BUCKET_UNDER_REVIEW = "under_review"
 BUCKET_IN_PROGRESS = "in_progress"
 
-# Buckets that participate in payment-rate denominators (not_billable,
-# archive and deleted claims are reported separately).
-RATED_BUCKETS = (
+# Buckets that finished the process — the only ones in rate denominators.
+# in_progress and under_review are reported in breakdown totals and their
+# own columns; not_billable, archive and deleted claims are reported
+# separately and never make up a total or a rate.
+FINAL_BUCKETS = (
     BUCKET_PAID,
     BUCKET_READY_TO_BE_PAID,
     BUCKET_DENIED,
-    BUCKET_UNDER_REVIEW,
-    BUCKET_IN_PROGRESS,
 )
 
 # Exact (lower-cased) status name -> bucket. Anything absent falls back to
