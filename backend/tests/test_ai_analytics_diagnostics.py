@@ -23,7 +23,7 @@ class TestDiagnosticsService:
         mock_cohort.return_value = []
         filters = AiAnalyticsFilters()
         import asyncio
-        result = asyncio.get_event_loop().run_until_complete(get_diagnostics_summary(None, filters))
+        result = asyncio.run(get_diagnostics_summary(None, filters))
         assert result.ai_runs == 0
         assert result.completed == 0
         assert result.errors == 0
@@ -63,7 +63,7 @@ class TestDiagnosticsService:
 
         filters = AiAnalyticsFilters()
         import asyncio
-        result = asyncio.get_event_loop().run_until_complete(get_diagnostics_summary(None, filters))
+        result = asyncio.run(get_diagnostics_summary(None, filters))
         assert result.ai_runs == 2
         assert result.completed == 2
         assert result.retries == 1  # claim 200 has retry_count=2
@@ -94,7 +94,7 @@ class TestDiagnosticsService:
         mock_canc.side_effect = RuntimeError("cancellation query failed")
         mock_logs.return_value = {}
 
-        result = asyncio.get_event_loop().run_until_complete(
+        result = asyncio.run(
             get_diagnostics_summary(None, AiAnalyticsFilters())
         )
         assert result.data_complete is False
@@ -350,7 +350,7 @@ class TestDiagnosticsEligibility:
         mock_canc.return_value = {}
         mock_logs.return_value = {}
 
-        result = asyncio.get_event_loop().run_until_complete(
+        result = asyncio.run(
             get_diagnostics_summary(None, AiAnalyticsFilters())
         )
         assert result.ai_runs == 1          # only claim 100 qualifies

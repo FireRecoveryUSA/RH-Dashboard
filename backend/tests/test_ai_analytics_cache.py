@@ -23,8 +23,8 @@ class TestTtlCache:
             return call_count
 
         # TESTING is set to "true" in conftest
-        result1 = asyncio.get_event_loop().run_until_complete(fn())
-        result2 = asyncio.get_event_loop().run_until_complete(fn())
+        result1 = asyncio.run(fn())
+        result2 = asyncio.run(fn())
         assert result1 == 1
         assert result2 == 2  # Not cached — called twice
 
@@ -43,8 +43,8 @@ class TestTtlCache:
                 call_count += 1
                 return call_count
 
-            result1 = asyncio.get_event_loop().run_until_complete(fn())
-            result2 = asyncio.get_event_loop().run_until_complete(fn())
+            result1 = asyncio.run(fn())
+            result2 = asyncio.run(fn())
             assert result1 == 1
             assert result2 == 1  # Cached — same result
             assert call_count == 1
@@ -63,11 +63,11 @@ class TestTtlCache:
                 call_count += 1
                 return call_count
 
-            asyncio.get_event_loop().run_until_complete(fn())
+            asyncio.run(fn())
             assert cache_size() == 1
             clear_cache()
             assert cache_size() == 0
-            asyncio.get_event_loop().run_until_complete(fn())
+            asyncio.run(fn())
             assert call_count == 2
         finally:
             os.environ["TESTING"] = old
