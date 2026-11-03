@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+  pull_request:
 
 permissions:
   id-token: write
@@ -57,6 +58,8 @@ jobs:
   deploy:
     name: Build, Push, and Deploy
     needs: test
+    # Deploy only on pushes to main — pull_request runs are tests only.
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     # Production environment gate.
     #
