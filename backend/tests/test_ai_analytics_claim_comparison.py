@@ -941,14 +941,34 @@ class TestClaimComparisonRoute:
                 p.stop()
         assert response.status_code == 200
         data = response.json()
-        assert data["period_start"] == "2026-01-01"
+        assert data["period_start"] == "2026-07-01"
         assert data["period_end"] == "2026-08-13"
         for key in ("overall", "ai_released", "other", "other_manual", "other_ai_rejected",
                     "weekly", "by_incident_type", "by_billing_target", "not_billable",
                     "unmapped_statuses", "resolved_columns", "source_status", "data_complete"):
             assert key in data
         assert data["not_billable"]["marked_by_processor"] == 0
-        assert data["weekly"][0]["week"] == "2026-W01"
+        assert data["weekly"][0]["week"] == "2026-W27"
+
+    @pytest.mark.parametrize("server_date,expected_start", [
+        ("2026-08-13", "2026-07-01"),  # after Jul 1 -> same year's Jul 1
+        ("2026-07-01", "2026-07-01"),  # exactly Jul 1
+        ("2027-02-10", "2026-07-01"),  # before Jul 1 -> previous year's Jul 1
+        ("2026-06-30", "2025-07-01"),  # last day before Jul -> previous year
+    ])
+    def test_comparison_window_never_inverts(self, server_date, expected_start):
+        from ai_analytics.claim_comparison_service import resolve_comparison_window
+        with patch(f"{SQL}.get_server_date", return_value=server_date):
+            start, end = resolve_comparison_window(None)
+        assert start == expected_start
+        assert end == server_date
+
+    def test_comparison_window_explicit_end_before_july(self):
+        from ai_analytics.claim_comparison_service import resolve_comparison_window
+        with patch(f"{SQL}.get_server_date", return_value="2026-08-13"):
+            start, end = resolve_comparison_window("2026-03-01")
+        assert start == "2025-07-01"
+        assert end == "2026-03-01"
 
     def test_claim_comparison_requires_auth(self, test_client):
         response = test_client.get("/api/ai-analytics/claim-comparison")

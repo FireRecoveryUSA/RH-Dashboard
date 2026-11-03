@@ -781,8 +781,10 @@ AI and released from the AI grid (`ai_released`) against all other runs
 grid outcome is still pending or unknown are counted as `ai_pending` and
 excluded from every rate.
 
-- **Window**: fixed from Jan 1 of the SQL server's year (`resolve_comparison_window`)
-  through `end_date` (default today). Rural Metro departments
+- **Window**: fixed from the most recent July 1 through `end_date`
+  (`resolve_comparison_window`; default end = today). With an explicit
+  `end_date`, the July 1 anchor follows that date's year — falling back to
+  the previous year when needed so the window never inverts. Rural Metro departments
   (`EXCLUDED_DEPARTMENT_IDS`) are excluded in SQL.
 - **Final state**: `Claims` is system-versioned (`ValidFrom` is the row-start column,
   resolved from metadata). Status versions come from the current table plus

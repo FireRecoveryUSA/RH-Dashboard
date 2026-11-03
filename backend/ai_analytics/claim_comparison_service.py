@@ -99,10 +99,18 @@ def _parse_ts(value: Any) -> datetime:
 
 
 def resolve_comparison_window(end_date: Optional[str]) -> Tuple[str, str]:
-    """Fixed window: Jan 1 of the SQL server's year through ``end_date`` (default today)."""
+    """Fixed window: most recent July 1 through ``end_date`` (default today).
+
+    Uses the effective end date's year; if that July 1 is still in the future
+    (Jan–Jun), the window starts on July 1 of the previous year so it never
+    inverts.
+    """
     today = date.fromisoformat(sql_repo.get_server_date())
-    start = date(today.year, 1, 1)
-    return start.isoformat(), end_date or today.isoformat()
+    end = date.fromisoformat(end_date) if end_date else today
+    start = date(end.year, 7, 1)
+    if start > end:
+        start = date(end.year - 1, 7, 1)
+    return start.isoformat(), end.isoformat()
 
 
 def _chunks(items: List[int], size: int) -> Iterator[List[int]]:
