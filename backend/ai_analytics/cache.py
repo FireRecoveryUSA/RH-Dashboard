@@ -20,6 +20,11 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_TTL = 60  # seconds
 
+# How long a retained good entry keeps serving after an incomplete
+# recomputation — a bounded retry window so requests don't repeat the
+# expensive read on every call during a partial outage.
+_INCOMPLETE_RETRY_TTL = 120  # seconds
+
 _cache: Dict[str, Tuple[float, Any]] = {}
 
 
@@ -67,11 +72,18 @@ def cached(
             # last good value (the claim-comparison warmer does the same via
             # touch_cache).
             result = await fn(*args, **kwargs)
-            if entry is not None and getattr(result, "data_complete", True) is False:
-                logger.warning(
-                    f"AI analytics cache: keeping stale {name} entry over incomplete result"
-                )
-                return entry[1]
+            if getattr(result, "data_complete", True) is False:
+                if entry is not None:
+                    logger.warning(
+                        f"AI analytics cache: keeping stale {name} entry over incomplete result"
+                    )
+                    # Bounded retry: serve the stale value for a short window
+                    # instead of recomputing on every request, then retry.
+                    _cache[key] = (time.time() + _INCOMPLETE_RETRY_TTL, entry[1])
+                    return entry[1]
+                # No good entry to fall back on — don't cache the incomplete
+                # result so the next request retries the source.
+                return result
             _cache[key] = (time.time() + ttl, result)
             logger.debug(f"AI analytics cache miss: {name} (cached for {ttl}s)")
             return result
@@ -112,11 +124,13 @@ def touch_cache(
 
     Used by the warmer after a failed refresh: the last good value stays
     servable until a successful warm (or a request) produces a complete
-    replacement. Returns False when there is no entry to extend.
+    replacement. Returns False when there is no entry, or the entry's value
+    is itself incomplete — extending an incomplete entry would pin an empty
+    dashboard in place and stop requests from retrying the source.
     """
     key = _make_key(func_name, args, kwargs)
     entry = _cache.get(key)
-    if entry is None:
+    if entry is None or getattr(entry[1], "data_complete", True) is False:
         return False
     _cache[key] = (time.time() + ttl, entry[1])
     return True

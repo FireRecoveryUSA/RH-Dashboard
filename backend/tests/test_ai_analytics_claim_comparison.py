@@ -608,9 +608,29 @@ class TestCacheWarmer:
         with patch.object(cache_mod, "_is_testing", return_value=False):
             cache_mod.clear_cache()
             cache_mod.prime_cache("probe", (), {}, "GOOD", ttl=-1)  # already expired
-            # Expired entry + incomplete recompute -> stale value served, entry kept
+            # Expired entry + incomplete recompute -> stale value served once,
+            # then from the bounded retry window without recomputing.
             assert asyncio.run(probe()) == "GOOD"
             assert asyncio.run(probe()) == "GOOD"
+            assert len(calls) == 1
+            cache_mod.clear_cache()
+
+    def test_cache_does_not_store_incomplete_result(self):
+        from ai_analytics import cache as cache_mod
+        calls = []
+
+        @cache_mod.cached(ttl=60, func_name="probe2")
+        async def probe2():
+            calls.append(1)
+            return SimpleNamespace(data_complete=False, n=len(calls))
+
+        with patch.object(cache_mod, "_is_testing", return_value=False):
+            cache_mod.clear_cache()
+            first = asyncio.run(probe2())
+            second = asyncio.run(probe2())
+            # Nothing cached -> every call retries the source
+            assert len(calls) == 2
+            assert first.n == 1 and second.n == 2
             cache_mod.clear_cache()
 
     def test_touch_cache_extends_existing_entry(self):
@@ -623,6 +643,10 @@ class TestCacheWarmer:
             assert value == "GOOD"
             assert expires_at > 0
             assert cache_mod.touch_cache("missing", (1,), {}, ttl=60) is False
+            # An incomplete entry must not be renewed — let it expire so
+            # requests retry the source.
+            cache_mod.prime_cache("bad", (), {}, SimpleNamespace(data_complete=False), ttl=60)
+            assert cache_mod.touch_cache("bad", (), {}, ttl=3600) is False
             cache_mod.clear_cache()
 
     def test_status_versions_bound_rows_before_grouping(self):
