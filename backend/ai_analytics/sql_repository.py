@@ -670,26 +670,37 @@ def get_deleted_runs_count(
     end_date: str,
     department_id: Optional[int],
 ) -> int:
-    """Deleted runs created in the window (dbo.claims_deleted), excluding Rural Metro.
+    """Deleted runs submitted in the window (dbo.claims_deleted), excluding Rural Metro.
 
-    ``dept_id`` on claims_deleted is not verified against production; the
-    schema-check endpoint reports the table's columns.
+    Filters ``date_of_submitted`` to match the live scope query, so a run
+    created last year and submitted this year is still counted. Falls back to
+    ``created`` when claims_deleted lacks the column (its schema is not fully
+    verified; the schema-check endpoint reports the table's columns).
     """
-    query = f"""
-    SELECT COUNT(DISTINCT x.id) AS deleted_runs
-    FROM dbo.claims_deleted x
-    WHERE x.submitted = 1
-      AND x.original_run_id IS NOT NULL
-      AND x.created >= %(start_date)s
-      AND x.created < DATEADD(day, 1, %(end_date)s)
-      AND (%(department_id)s IS NULL OR x.dept_id = %(department_id)s)
-      AND (x.dept_id IS NULL OR x.dept_id NOT IN ({_EXCLUDED_DEPT_SQL}))
-    """
-    rows = _execute_parameterized(
-        query,
-        {"start_date": start_date, "end_date": end_date, "department_id": department_id},
-    )
-    return int(rows[0]["deleted_runs"]) if rows else 0
+    for date_column in ("date_of_submitted", "created"):
+        query = f"""
+        SELECT COUNT(DISTINCT x.id) AS deleted_runs
+        FROM dbo.claims_deleted x
+        WHERE x.submitted = 1
+          AND x.original_run_id IS NOT NULL
+          AND x.{date_column} >= %(start_date)s
+          AND x.{date_column} < DATEADD(day, 1, %(end_date)s)
+          AND (%(department_id)s IS NULL OR x.dept_id = %(department_id)s)
+          AND (x.dept_id IS NULL OR x.dept_id NOT IN ({_EXCLUDED_DEPT_SQL}))
+        """
+        try:
+            rows = _execute_parameterized(
+                query,
+                {"start_date": start_date, "end_date": end_date, "department_id": department_id},
+            )
+            return int(rows[0]["deleted_runs"]) if rows else 0
+        except Exception as e:
+            if date_column == "created":
+                raise
+            logger.warning(
+                f"claims_deleted.{date_column} query failed, falling back to 'created': {e}"
+            )
+    return 0
 
 
 def get_claim_status_versions(
