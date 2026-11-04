@@ -606,6 +606,35 @@ def _quote_identifier(name: str) -> str:
     return "[" + name.replace("]", "]]") + "]"
 
 
+_table_columns_cache: Dict[str, List[str]] = {}
+
+
+def _cached_table_columns(table_name: str) -> List[str]:
+    """``get_table_column_names`` with per-process caching (schema never changes mid-run)."""
+    if table_name not in _table_columns_cache:
+        _table_columns_cache[table_name] = get_table_column_names(table_name)
+    return _table_columns_cache[table_name]
+
+
+def _pick_column(columns: List[str], *candidates: str) -> Optional[str]:
+    """First candidate (case-insensitive) that exists in the column list."""
+    lowered = {c.lower(): c for c in columns}
+    for candidate in candidates:
+        if candidate.lower() in lowered:
+            return lowered[candidate.lower()]
+    return None
+
+
+def _claim_scope_extra_columns() -> str:
+    """Optional Claims columns for the comparison scope — verified at runtime."""
+    claims_cols = _cached_table_columns("Claims")
+    cols = ""
+    for col in ("user_id", "debug"):
+        if _pick_column(claims_cols, col):
+            cols += f",\n        c.{_quote_identifier(col)}"
+    return cols
+
+
 def get_claim_comparison_scope(
     start_date: str,
     end_date: str,
@@ -629,9 +658,13 @@ def get_claim_comparison_scope(
         c.dept_id,
         c.run_number,
         c.date_of_submitted,
+        c.amount_invoiced,
+        c.invoice_number,
+        c.status AS current_status,
         d.Name AS department_name,
+        d.incidents_billing AS dept_incidents_billing,
         c.type_id,
-        rt.type AS type_name
+        rt.type AS type_name{_claim_scope_extra_columns()}
     FROM dbo.Claims c
     LEFT JOIN dbo.Departments d ON d.ID = c.dept_id
     LEFT JOIN dbo.run_types rt ON rt.id = c.type_id
@@ -773,3 +806,138 @@ def get_claim_status_versions(
     return _execute_parameterized(
         query, {"claim_ids_csv": claim_ids_csv, "as_of": as_of}
     )
+
+
+# ---------------------------------------------------------------------------
+# Claim drill-down details
+# ---------------------------------------------------------------------------
+
+_NOT_BILLABLE_STATUS_SQL = "'unbillable','non-billable (insufficient information)'"
+
+
+def _chunked_ids(claim_ids: List[int], size: int = 2000) -> List[List[int]]:
+    return [claim_ids[i:i + size] for i in range(0, len(claim_ids), size)]
+
+
+def get_claim_services_totals(claim_ids: List[int]) -> Dict[int, float]:
+    """Summed invoice line-item totals (rate * quantity) per claim."""
+    totals: Dict[int, float] = {}
+    for chunk in _chunked_ids(claim_ids):
+        csv = ",".join(str(int(cid)) for cid in chunk)
+        rows = _execute_parameterized(
+            """
+            SELECT cs.claim_id,
+                   SUM(CONVERT(float, cs.rate) * CONVERT(float, cs.quantity)) AS services_total
+            FROM dbo.claim_services cs
+            WHERE cs.claim_id IN (
+                SELECT CAST(value AS int) FROM STRING_SPLIT(CAST(%(ids)s AS nvarchar(max)), ',')
+            )
+            GROUP BY cs.claim_id
+            """,
+            {"ids": csv},
+        )
+        for row in rows:
+            if row.get("claim_id") is not None:
+                totals[int(row["claim_id"])] = float(row.get("services_total") or 0.0)
+    return totals
+
+
+def get_not_billable_markers(claim_ids: List[int], row_start_column: str) -> Dict[int, Dict[str, Any]]:
+    """First 'not billable' version per claim: when it was marked and by whom (user_id).
+
+    ``user_id`` is the processor who changed the status. When claimsHistory
+    lacks the column the marker still carries the timestamp.
+    """
+    history_cols = _cached_table_columns("claimsHistory")
+    user_id_col = _pick_column(history_cols or [], "user_id")
+    row_start = _quote_identifier(row_start_column)
+    user_select = f"h.{_quote_identifier(user_id_col)}" if user_id_col else "CAST(NULL AS int)"
+    markers: Dict[int, Dict[str, Any]] = {}
+    for chunk in _chunked_ids(claim_ids):
+        csv = ",".join(str(int(cid)) for cid in chunk)
+        rows = _execute_parameterized(
+            f"""
+            SELECT h.id, {user_select} AS user_id, h.{row_start} AS marked_at
+            FROM AuditData.claimsHistory h
+            WHERE LOWER(h.status) IN ({_NOT_BILLABLE_STATUS_SQL})
+              AND h.id IN (
+                  SELECT CAST(value AS int) FROM STRING_SPLIT(CAST(%(ids)s AS nvarchar(max)), ',')
+              )
+            ORDER BY h.id, h.{row_start}
+            """,
+            {"ids": csv},
+        )
+        for row in rows:
+            if row.get("id") is None:
+                continue
+            cid = int(row["id"])
+            if cid not in markers:  # rows arrive ordered by row_start — first wins
+                markers[cid] = {
+                    "user_id": row.get("user_id"),
+                    "marked_at": row.get("marked_at"),
+                }
+    return markers
+
+
+_ADJUSTER_TABLE_CANDIDATES = ("adjusters", "Adjusters")
+
+
+def get_claim_adjusters(claim_ids: List[int]) -> Dict[int, Dict[str, Optional[str]]]:
+    """Insurance company and adjuster name per claim from the adjusters table.
+
+    The table's exact column names are resolved from metadata: a claim link
+    column, an insurance-company column, and an adjuster-name column. Returns
+    an empty map when the table or its claim link cannot be resolved.
+    """
+    adj_cols: List[str] = []
+    for table in _ADJUSTER_TABLE_CANDIDATES:
+        adj_cols = _cached_table_columns(table)
+        if adj_cols:
+            table_name = table
+            break
+    if not adj_cols:
+        return {}
+    link_col = _pick_column(adj_cols, "claim_id", "claimid", "claimId", "claim")
+    company_col = _pick_column(
+        adj_cols,
+        "insurance_company", "insurancecompany", "insurance_company_name",
+        "insurance_name", "company_name", "company", "carrier", "insurer",
+    )
+    name_col = _pick_column(
+        adj_cols,
+        "adjuster_name", "adjustername", "name", "full_name", "fullname", "adjuster",
+    )
+    if link_col is None or (company_col is None and name_col is None):
+        logger.warning(
+            f"adjusters table found but claim link/company columns unresolved: {adj_cols}"
+        )
+        return {}
+    selects = [f"a.{_quote_identifier(link_col)} AS claim_id"]
+    selects.append(
+        f"a.{_quote_identifier(company_col)} AS insurance_company" if company_col
+        else "CAST(NULL AS nvarchar) AS insurance_company"
+    )
+    selects.append(
+        f"a.{_quote_identifier(name_col)} AS adjuster_name" if name_col
+        else "CAST(NULL AS nvarchar) AS adjuster_name"
+    )
+    by_claim: Dict[int, Dict[str, Optional[str]]] = {}
+    for chunk in _chunked_ids(claim_ids):
+        csv = ",".join(str(int(cid)) for cid in chunk)
+        rows = _execute_parameterized(
+            f"""
+            SELECT {", ".join(selects)}
+            FROM dbo.{_quote_identifier(table_name)} a
+            WHERE a.{_quote_identifier(link_col)} IN (
+                SELECT CAST(value AS int) FROM STRING_SPLIT(CAST(%(ids)s AS nvarchar(max)), ',')
+            )
+            """,
+            {"ids": csv},
+        )
+        for row in rows:
+            if row.get("claim_id") is not None:
+                by_claim[int(row["claim_id"])] = {
+                    "insurance_company": row.get("insurance_company"),
+                    "adjuster_name": row.get("adjuster_name"),
+                }
+    return by_claim

@@ -396,6 +396,33 @@ class ClaimComparisonNotBillable(BaseModel):
     identified_by_system: int = 0
 
 
+class ClaimComparisonClaim(BaseModel):
+    """Per-claim row for the drill-down view — one row per tracked claim."""
+    claim_id: int
+    run_number: Optional[str] = None
+    cohort: str  # ai_released | other
+    subtype: Optional[str] = None  # manual | ai_rejected (other only)
+    department_id: Optional[int] = None
+    department_name: Optional[str] = None
+    department_allows_direct_billing: Optional[bool] = None
+    incident: str
+    status: Optional[str] = None
+    bucket: Optional[str] = None
+    billing_target: str = "unknown"
+    insurance_company: Optional[str] = None
+    adjuster_name: Optional[str] = None
+    invoice_number: Optional[str] = None
+    amount_invoiced: Optional[float] = None
+    ai_invoice_total: Optional[float] = None
+    services_total: Optional[float] = None
+    ever_not_billable: bool = False
+    not_billable_by: Optional[int] = None
+    not_billable_at: Optional[str] = None
+    submitted_at: Optional[str] = None
+    sent_to_insurance_at: Optional[str] = None
+    days_submitted_to_insurance: Optional[float] = None
+
+
 class AiClaimComparisonResponse(BaseModel):
     period_start: str
     period_end: str
@@ -411,6 +438,7 @@ class AiClaimComparisonResponse(BaseModel):
     by_incident_type: List[ClaimComparisonSegment] = Field(default_factory=list)
     by_billing_target: List[ClaimComparisonSegment] = Field(default_factory=list)
     not_billable: ClaimComparisonNotBillable
+    claims: List[ClaimComparisonClaim] = Field(default_factory=list)
     unmapped_statuses: Dict[str, int] = Field(default_factory=dict)
     resolved_columns: Dict[str, Optional[str]] = Field(default_factory=dict)
     source_status: Dict[str, str] = Field(default_factory=dict)

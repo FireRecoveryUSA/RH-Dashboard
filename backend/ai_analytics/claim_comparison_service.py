@@ -25,7 +25,9 @@ dashboards.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import re
 import os
 import socket
 import time
@@ -38,6 +40,7 @@ from .models import (
     AiAnalyticsFilters,
     AiClaimComparisonResponse,
     AiClaimComparisonSchemaCheck,
+    ClaimComparisonClaim,
     ClaimComparisonNotBillable,
     ClaimComparisonNotBillableCohort,
     ClaimComparisonSegment,
@@ -68,6 +71,7 @@ from .claim_status_config import (
     classify_claim_status,
     incident_type_label,
     is_mapped_claim_status,
+    INSURANCE_BILLING_STATUSES,
 )
 from .cache import cached, prime_cache, touch_cache
 
@@ -233,6 +237,83 @@ def _process_entry_local_date(
     return (earliest + local_offset).date()
 
 
+_INCIDENT_KEY_RE = re.compile(
+    r'"?(?:incident[_ ]?type|incidentType|neris[_ ]?(?:incident[_ ]?)?type)"?\s*[:=]\s*"?([^",}\n]+)',
+    re.IGNORECASE,
+)
+
+
+def _incident_from_debug(debug: Any) -> Optional[str]:
+    """True incident (NERIS) type stored in the Claims.debug column.
+
+    The debug blob may be JSON or embedded text; look for an incident-type
+    key either way. Returns None when nothing parses — callers fall back to
+    the run-type label.
+    """
+    if not debug:
+        return None
+    text = debug if isinstance(debug, str) else str(debug)
+    try:
+        parsed = json.loads(text)
+    except (ValueError, TypeError):
+        parsed = None
+    if isinstance(parsed, dict):
+        for key in (
+            "incident_type", "incidentType", "incident_type_name",
+            "neris_incident_type", "neris_type", "incident",
+        ):
+            value = parsed.get(key)
+            if value:
+                return str(value).strip() or None
+    match = _INCIDENT_KEY_RE.search(text)
+    if match:
+        value = match.group(1).strip().strip('"').strip()
+        return value or None
+    return None
+
+
+def _fetch_claim_extras(
+    claim_ids: List[int],
+    row_start_column: str,
+) -> Tuple[Dict[int, float], Dict[int, Dict[str, Optional[str]]], Dict[int, Dict[str, Any]]]:
+    """Per-claim extras for the drill-down rows: line-item totals, adjusters,
+    and who/when marked not-billable. Sync; called via asyncio.to_thread."""
+    return (
+        sql_repo.get_claim_services_totals(claim_ids),
+        sql_repo.get_claim_adjusters(claim_ids),
+        sql_repo.get_not_billable_markers(claim_ids, row_start_column),
+    )
+
+
+def _effective_status_name(
+    versions: Iterable[Tuple[str, str, datetime, bool, datetime]],
+    as_of: Optional[datetime],
+) -> Optional[str]:
+    """Raw status of the effective version (same selection rule as _effective_state)."""
+    best: Optional[str] = None
+    best_key: Optional[Tuple[datetime, bool]] = None
+    for status, bucket, last_start, is_current, _fs in versions:
+        if bucket == BUCKET_ARCHIVE:
+            continue
+        if as_of is not None and last_start >= as_of:
+            continue
+        key = (last_start, is_current)
+        if best_key is None or key > best_key:
+            best_key = key
+            best = status
+    return best
+
+
+def _first_insurance_start(
+    versions: Iterable[Tuple[str, str, datetime, bool, datetime]],
+) -> Optional[datetime]:
+    starts = [
+        fs for status, _b, _ls, _cur, fs in versions
+        if status and status.strip().lower() in INSURANCE_BILLING_STATUSES
+    ]
+    return min(starts) if starts else None
+
+
 class _ClaimOutcome:
     __slots__ = (
         "cohort", "subtype", "bucket", "effective_date", "ever_not_billable",
@@ -381,6 +462,7 @@ def _assemble(
     resolved_columns: Dict[str, Optional[str]],
     source_status: Dict[str, str],
     data_complete: bool,
+    claims: Optional[List[ClaimComparisonClaim]] = None,
 ) -> AiClaimComparisonResponse:
     released = [o for o in outcomes if o.cohort == COHORT_AI_RELEASED]
     other = [o for o in outcomes if o.cohort == COHORT_OTHER]
@@ -400,6 +482,7 @@ def _assemble(
         by_billing_target=_segments(
             outcomes, lambda o: billing_target_label(o.billing_target),
         ),
+        claims=claims or [],
         not_billable=ClaimComparisonNotBillable(
             ai_released=_not_billable_cohort(released),
             other=_not_billable_cohort(other),
@@ -545,31 +628,94 @@ async def _compute_claim_payment_comparison(
         source_status["recoveryhub_sql"] = "partial"
         data_complete = False
 
+    tracked_ids = [t[0] for t in tracked]
+    services_totals: Dict[int, float] = {}
+    adjusters: Dict[int, Dict[str, Optional[str]]] = {}
+    nb_markers: Dict[int, Dict[str, Any]] = {}
+    try:
+        services_totals, adjusters, nb_markers = await asyncio.to_thread(
+            _fetch_claim_extras, tracked_ids, row_start_column,
+        )
+    except Exception as e:
+        logger.error(f"Claim comparison claim-extras query failed: {e}")
+        source_status["recoveryhub_sql"] = "partial"
+        data_complete = False
+
     outcomes: List[_ClaimOutcome] = []
+    claim_rows: List[ClaimComparisonClaim] = []
     for claim_id, cohort, subtype, record, row in tracked:
         claim_versions = versions.get(claim_id, [])
         effective = _effective_state(claim_versions, as_of)
+        ever_nb = any(
+            b == BUCKET_NOT_BILLABLE
+            for _, b, row_start, _, _fs in claim_versions
+            if row_start < as_of
+        )
         system_not_billable = record is not None and classify_billability(
             billing_category=None,
             is_billable=record.get("is_billable"),
         )["not_billable"]
+        incident = (
+            _incident_from_debug(row.get("debug"))
+            or incident_type_label(row.get("type_id"), row.get("type_name"))
+        )
+        billing_target = billing_target_from_statuses(
+            (status, last_start, is_current)
+            for status, _, last_start, is_current, _fs in claim_versions
+            if last_start < as_of
+        )
         outcomes.append(_ClaimOutcome(
             cohort=cohort,
             subtype=subtype,
             bucket=effective[0] if effective else None,
             effective_date=effective[1] if effective else None,
-            ever_not_billable=any(
-                b == BUCKET_NOT_BILLABLE
-                for _, b, row_start, _, _fs in claim_versions
-                if row_start < as_of
-            ),
-            incident=incident_type_label(row.get("type_id"), row.get("type_name")),
-            billing_target=billing_target_from_statuses(
-                (status, last_start, is_current)
-                for status, _, last_start, is_current, _fs in claim_versions
-                if last_start < as_of
-            ),
+            ever_not_billable=ever_nb,
+            incident=incident,
+            billing_target=billing_target,
             system_not_billable=bool(system_not_billable),
+        ))
+
+        # Drill-down row
+        adjuster = adjusters.get(claim_id, {})
+        marker = nb_markers.get(claim_id, {})
+        submitted_dt = _parse_ts(row["date_of_submitted"]) if row.get("date_of_submitted") else None
+        sent_insurance = _first_insurance_start(claim_versions)
+        days_to_insurance = (
+            round((sent_insurance - submitted_dt).total_seconds() / 86400, 1)
+            if sent_insurance and submitted_dt else None
+        )
+        dept_billing = row.get("dept_incidents_billing")
+        try:
+            dept_allows_direct = bool(int(dept_billing)) if dept_billing is not None else None
+        except (TypeError, ValueError):
+            dept_allows_direct = None
+        claim_rows.append(ClaimComparisonClaim(
+            claim_id=claim_id,
+            run_number=row.get("run_number"),
+            cohort=cohort,
+            subtype=subtype,
+            department_id=row.get("dept_id"),
+            department_name=row.get("department_name"),
+            department_allows_direct_billing=dept_allows_direct,
+            incident=incident,
+            status=_effective_status_name(claim_versions, as_of),
+            bucket=effective[0] if effective else None,
+            billing_target=billing_target,
+            insurance_company=adjuster.get("insurance_company"),
+            adjuster_name=adjuster.get("adjuster_name"),
+            invoice_number=row.get("invoice_number"),
+            amount_invoiced=row.get("amount_invoiced"),
+            ai_invoice_total=(record or {}).get("invoice_total"),
+            services_total=services_totals.get(claim_id),
+            ever_not_billable=ever_nb,
+            not_billable_by=marker.get("user_id"),
+            not_billable_at=(
+                _parse_ts(marker["marked_at"]).isoformat()
+                if marker.get("marked_at") else None
+            ),
+            submitted_at=submitted_dt.isoformat() if submitted_dt else None,
+            sent_to_insurance_at=sent_insurance.isoformat() if sent_insurance else None,
+            days_submitted_to_insurance=days_to_insurance,
         ))
 
     resolved_columns: Dict[str, Optional[str]] = {
@@ -577,7 +723,7 @@ async def _compute_claim_payment_comparison(
     }
     return _assemble(
         start, end, outcomes, ai_pending, deleted_runs, unmapped,
-        resolved_columns, source_status, data_complete,
+        resolved_columns, source_status, data_complete, claims=claim_rows,
     )
 
 
