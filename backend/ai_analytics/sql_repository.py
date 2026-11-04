@@ -980,3 +980,74 @@ def get_claim_adjusters(claim_ids: List[int]) -> Dict[int, Dict[str, Optional[st
                     "adjuster_name": row.get("adjuster_name"),
                 }
     return by_claim
+
+
+def get_user_names(user_ids: List[int]) -> Dict[int, str]:
+    """Resolve available names for user IDs from the first recognized dbo table."""
+    if not user_ids:
+        return {}
+
+    table_name: Optional[str] = None
+    table_cols: List[str] = []
+    id_col: Optional[str] = None
+    for candidate in ("Users", "AspNetUsers", "User", "rh_users"):
+        columns = _cached_table_columns(candidate)
+        candidate_id = _pick_column(columns, "id", "user_id", "UserId")
+        if columns and candidate_id:
+            table_name = candidate
+            table_cols = columns
+            id_col = candidate_id
+            break
+    if table_name is None or id_col is None:
+        return {}
+
+    logger.info("Resolving claim-comparison user names from dbo.%s", table_name)
+    first_col = _pick_column(table_cols, "first_name", "firstname", "FirstName", "fname")
+    last_col = _pick_column(table_cols, "last_name", "lastname", "LastName", "lname")
+    full_col = _pick_column(
+        table_cols,
+        "full_name", "fullname", "display_name", "DisplayName",
+        "name", "username", "user_name", "UserName", "email", "Email",
+    )
+    if first_col is None and last_col is None and full_col is None:
+        return {}
+
+    first_select = (
+        f"u.{_quote_identifier(first_col)}" if first_col
+        else "CAST(NULL AS nvarchar)"
+    )
+    last_select = (
+        f"u.{_quote_identifier(last_col)}" if last_col
+        else "CAST(NULL AS nvarchar)"
+    )
+    full_select = (
+        f"u.{_quote_identifier(full_col)}" if full_col
+        else "CAST(NULL AS nvarchar)"
+    )
+    names: Dict[int, str] = {}
+    for chunk in _chunked_ids(user_ids):
+        csv = ",".join(str(int(user_id)) for user_id in chunk)
+        rows = _execute_parameterized(
+            f"""
+            SELECT u.{_quote_identifier(id_col)} AS user_id,
+                   {first_select} AS first_name,
+                   {last_select} AS last_name,
+                   {full_select} AS full_name
+            FROM dbo.{_quote_identifier(table_name)} u
+            WHERE u.{_quote_identifier(id_col)} IN (
+                SELECT CAST(value AS int) FROM STRING_SPLIT(CAST(%(ids)s AS nvarchar(max)), ',')
+            )
+            """,
+            {"ids": csv},
+        )
+        for row in rows:
+            if row.get("user_id") is None:
+                continue
+            first_name = str(row.get("first_name") or "").strip()
+            last_name = str(row.get("last_name") or "").strip()
+            name = " ".join(part for part in (first_name, last_name) if part)
+            if not name:
+                name = str(row.get("full_name") or "").strip()
+            if name:
+                names[int(row["user_id"])] = name
+    return names

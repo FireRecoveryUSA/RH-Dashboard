@@ -195,7 +195,7 @@ def _run(scope_rows, versions_rows, records=None, deleted=0, ai_complete=True,
         return [r for r in versions_rows if r["id"] in chunk]
 
     if extras is None:
-        extras = ({}, {}, {}, True)
+        extras = ({}, {}, {}, {}, True)
     with patch(f"{SQL}.get_claims_row_start_column", return_value=ROW_START), \
          patch(f"{SQL}.get_claim_comparison_scope", return_value=scope_rows), \
          patch(f"{SQL}.get_claim_status_versions", side_effect=fake_versions), \
@@ -582,6 +582,52 @@ class TestChunkingAndSql:
         assert "LAG(" in query
         assert "PARTITION BY x.id" in query
         assert "FOR SYSTEM_TIME" not in query.upper()
+
+    def test_user_names_resolve_first_and_last_name(self):
+        rows = [{
+            "user_id": 77,
+            "first_name": " Pat ",
+            "last_name": " Smith ",
+            "full_name": None,
+        }]
+        with patch(
+            f"{SQL}._cached_table_columns",
+            side_effect=lambda table: ["id", "first_name", "last_name"] if table == "Users" else [],
+        ), patch(f"{SQL}._execute_parameterized", return_value=rows) as execute:
+            result = sql_repo.get_user_names([77])
+        query, _ = execute.call_args.args
+        assert result == {77: "Pat Smith"}
+        assert "FROM dbo.[Users] u" in query
+        assert "FOR SYSTEM_TIME" not in query.upper()
+
+    def test_user_names_fall_back_to_full_name(self):
+        rows = [{
+            "user_id": 77,
+            "first_name": None,
+            "last_name": None,
+            "full_name": "  Patricia Smith  ",
+        }]
+        with patch(
+            f"{SQL}._cached_table_columns",
+            side_effect=lambda table: ["id", "full_name"] if table == "Users" else [],
+        ), patch(f"{SQL}._execute_parameterized", return_value=rows):
+            result = sql_repo.get_user_names([77])
+        assert result == {77: "Patricia Smith"}
+
+    def test_user_names_without_resolvable_table_or_empty_ids_do_not_query(self):
+        with patch(f"{SQL}._cached_table_columns", return_value=[]) as columns, \
+             patch(f"{SQL}._execute_parameterized") as execute:
+            assert sql_repo.get_user_names([77]) == {}
+        assert [call.args[0] for call in columns.call_args_list] == [
+            "Users", "AspNetUsers", "User", "rh_users",
+        ]
+        execute.assert_not_called()
+
+        with patch(f"{SQL}._cached_table_columns") as columns, \
+             patch(f"{SQL}._execute_parameterized") as execute:
+            assert sql_repo.get_user_names([]) == {}
+        columns.assert_not_called()
+        execute.assert_not_called()
 
     def test_scope_query_excludes_rural_metro_and_joins_run_types(self):
         with patch(f"{SQL}._execute_parameterized", return_value=[]) as execute:
@@ -1136,6 +1182,7 @@ class TestClaimRows:
             {1: 1100.0, 2: 0.0},
             {1: {"insurance_company": "Acme Ins", "adjuster_name": "Jane"}},
             {2: {"user_id": 77, "marked_at": "2026-03-05T00:00:00", "prior_status": "Assigned"}},
+            {77: "Pat Smith"},
             True,
         )
         resp = _run(scope, versions, records, extras=extras)
@@ -1163,10 +1210,40 @@ class TestClaimRows:
         assert c2.incident == "Structure Fire"  # no debug -> run type label
         assert c2.ever_not_billable is True
         assert c2.not_billable_by == 77
+        assert c2.not_billable_by_name == "Pat Smith"
         assert c2.not_billable_at == "2026-03-05T00:00:00"
         assert c2.status_when_not_billable == "Assigned"
         assert c2.sent_to_insurance_at is None
         assert c2.days_submitted_to_insurance is None
+
+    def test_user_name_lookup_failure_preserves_markers_and_marks_partial(self):
+        markers = {
+            3: {
+                "user_id": 77,
+                "marked_at": "2026-03-05T00:00:00",
+                "prior_status": "Assigned",
+            }
+        }
+        with patch(f"{SQL}.get_claim_services_totals", return_value={}), \
+             patch(f"{SQL}.get_claim_adjusters", return_value={}), \
+             patch(f"{SQL}.get_not_billable_markers", return_value=markers), \
+             patch(f"{SQL}.get_user_names", side_effect=RuntimeError("lookup failed")) as lookup:
+            extras = svc._fetch_claim_extras([3], ROW_START)
+        lookup.assert_called_once_with([77])
+        assert extras == ({}, {}, markers, {}, False)
+
+        resp = _run(
+            [_scope_row(3, dept=9)],
+            _versions(3, ("Assigned", "2026-02-12T00:00:00"), ("Unbillable", "2026-03-05T00:00:00")),
+            [],
+            extras=extras,
+        )
+        [claim] = resp.claims
+        assert resp.data_complete is False
+        assert resp.source_status["recoveryhub_sql"] == "partial"
+        assert claim.not_billable_by == 77
+        assert claim.not_billable_by_name is None
+        assert claim.not_billable_at == "2026-03-05T00:00:00"
 
     def test_claim_rows_tolerate_missing_optional_fields(self):
         scope = [_scope_row(3, dept=9)]
@@ -1182,6 +1259,6 @@ class TestClaimRows:
     def test_failed_extras_marks_comparison_partial(self):
         scope = [_scope_row(3, dept=9)]
         versions = _versions(3, ("Assigned", "2026-02-12T00:00:00"))
-        resp = _run(scope, versions, [], extras=({}, {}, {}, False))
+        resp = _run(scope, versions, [], extras=({}, {}, {}, {}, False))
         assert resp.data_complete is False
         assert resp.source_status["recoveryhub_sql"] == "partial"

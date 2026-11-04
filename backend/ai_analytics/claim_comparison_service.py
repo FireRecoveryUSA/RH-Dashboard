@@ -297,15 +297,22 @@ def _fetch_claim_extras(
     claim_ids: List[int],
     row_start_column: str,
     as_of: Optional[datetime] = None,
-) -> Tuple[Dict[int, float], Dict[int, Dict[str, Optional[str]]], Dict[int, Dict[str, Any]], bool]:
+) -> Tuple[
+    Dict[int, float],
+    Dict[int, Dict[str, Optional[str]]],
+    Dict[int, Dict[str, Any]],
+    Dict[int, str],
+    bool,
+]:
     """Per-claim extras for the drill-down rows: line-item totals, adjusters,
-    and who/when marked not-billable, plus an all-queries-ok flag. Sync;
-    called via asyncio.to_thread. Each query degrades independently, and the
-    flag lets the caller mark the comparison partial when any extras read
+    who/when marked not-billable and user names, plus an all-queries-ok flag.
+    Sync; called via asyncio.to_thread. Each query degrades independently, and
+    the flag lets the caller mark the comparison partial when any extras read
     failed so the warmer never publishes missing details as complete."""
     totals: Dict[int, float] = {}
     adjusters: Dict[int, Dict[str, Optional[str]]] = {}
     markers: Dict[int, Dict[str, Any]] = {}
+    user_names: Dict[int, str] = {}
     ok = True
     try:
         totals = sql_repo.get_claim_services_totals(claim_ids)
@@ -322,7 +329,18 @@ def _fetch_claim_extras(
     except Exception as e:
         ok = False
         logger.error(f"not-billable markers query failed: {e}")
-    return totals, adjusters, markers, ok
+    try:
+        user_ids = sorted({
+            int(marker["user_id"])
+            for marker in markers.values()
+            if marker.get("user_id") is not None
+        })
+        user_names = sql_repo.get_user_names(user_ids)
+    except Exception as e:
+        ok = False
+        user_names = {}
+        logger.warning(f"not-billable user-name lookup failed: {e}")
+    return totals, adjusters, markers, user_names, ok
 
 
 def _first_insurance_start(
@@ -657,8 +675,9 @@ async def _compute_claim_payment_comparison(
     services_totals: Dict[int, float] = {}
     adjusters: Dict[int, Dict[str, Optional[str]]] = {}
     nb_markers: Dict[int, Dict[str, Any]] = {}
+    user_names: Dict[int, str] = {}
     try:
-        services_totals, adjusters, nb_markers, extras_ok = await asyncio.to_thread(
+        services_totals, adjusters, nb_markers, user_names, extras_ok = await asyncio.to_thread(
             _fetch_claim_extras, tracked_ids, row_start_column, as_of,
         )
         if not extras_ok:
@@ -738,6 +757,7 @@ async def _compute_claim_payment_comparison(
             services_total=services_totals.get(claim_id),
             ever_not_billable=ever_nb,
             not_billable_by=marker.get("user_id"),
+            not_billable_by_name=user_names.get(marker.get("user_id")),
             not_billable_at=marked_at_dt.isoformat() if marked_at_dt else None,
             status_when_not_billable=marker.get("prior_status"),
             submitted_at=submitted_dt.isoformat() if submitted_dt else None,
