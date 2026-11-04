@@ -553,6 +553,36 @@ class TestChunkingAndSql:
         assert f"[{ROW_START}]" in query
         assert params == {"claim_ids_csv": "1,2", "as_of": None}
 
+    def test_not_billable_markers_use_temporal_lag_and_first_row_wins(self):
+        rows = [
+            {
+                "id": 5,
+                "user_id": 9,
+                "marked_at": "2026-03-20T00:00:00",
+                "prior_status": "Assigned",
+            },
+            {
+                "id": 5,
+                "user_id": 10,
+                "marked_at": "2026-04-02T00:00:00",
+                "prior_status": "Assigned",
+            },
+        ]
+        with patch(f"{SQL}._execute_parameterized", return_value=rows) as execute, \
+             patch(f"{SQL}._cached_table_columns", return_value=["id", "status", "user_id"]):
+            result = sql_repo.get_not_billable_markers([5], ROW_START)
+        query, _ = execute.call_args.args
+        assert result == {
+            5: {
+                "user_id": 9,
+                "marked_at": "2026-03-20T00:00:00",
+                "prior_status": "Assigned",
+            }
+        }
+        assert "LAG(" in query
+        assert "PARTITION BY x.id" in query
+        assert "FOR SYSTEM_TIME" not in query.upper()
+
     def test_scope_query_excludes_rural_metro_and_joins_run_types(self):
         with patch(f"{SQL}._execute_parameterized", return_value=[]) as execute:
             sql_repo.get_claim_comparison_scope("2026-01-01", "2026-06-30", None, ROW_START, None, None)
@@ -1105,7 +1135,7 @@ class TestClaimRows:
         extras = (
             {1: 1100.0, 2: 0.0},
             {1: {"insurance_company": "Acme Ins", "adjuster_name": "Jane"}},
-            {2: {"user_id": 77, "marked_at": "2026-03-05T00:00:00"}},
+            {2: {"user_id": 77, "marked_at": "2026-03-05T00:00:00", "prior_status": "Assigned"}},
             True,
         )
         resp = _run(scope, versions, records, extras=extras)
@@ -1134,6 +1164,7 @@ class TestClaimRows:
         assert c2.ever_not_billable is True
         assert c2.not_billable_by == 77
         assert c2.not_billable_at == "2026-03-05T00:00:00"
+        assert c2.status_when_not_billable == "Assigned"
         assert c2.sent_to_insurance_at is None
         assert c2.days_submitted_to_insurance is None
 

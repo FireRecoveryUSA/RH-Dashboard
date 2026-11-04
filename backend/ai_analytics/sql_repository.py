@@ -855,6 +855,9 @@ def get_not_billable_markers(
     absent the marker still carries the timestamp. Both history versions and
     the live Claims row are considered, and ``as_of`` caps markers at the
     comparison window's end so future markers don't leak into past periods.
+    ``prior_status`` is the status of the temporal row immediately preceding
+    the first not-billable row (LAG over all claim rows; ties are ordered
+    history-before-current, then by status).
     """
     history_cols = _cached_table_columns("claimsHistory", schema="AuditData")
     history_user_col = _pick_column(history_cols or [], "user_id")
@@ -873,21 +876,31 @@ def get_not_billable_markers(
         csv = ",".join(str(int(cid)) for cid in chunk)
         rows = _execute_parameterized(
             f"""
-            SELECT m.id, m.user_id, m.marked_at
+            SELECT m.id, m.user_id, m.marked_at, m.prior_status
             FROM (
-                SELECT h.id, {history_user} AS user_id, h.{row_start} AS marked_at
-                FROM AuditData.claimsHistory h
-                WHERE LOWER(h.status) IN ({_NOT_BILLABLE_STATUS_SQL})
-                  {as_of_clause}
-                UNION ALL
-                SELECT c.id, {claims_user} AS user_id, c.{row_start} AS marked_at
-                FROM dbo.Claims c
-                WHERE LOWER(c.status) IN ({_NOT_BILLABLE_STATUS_SQL})
-                  {current_as_of_clause}
+                SELECT x.id, x.user_id, x.row_start AS marked_at, x.status,
+                       LAG(x.status) OVER (
+                           PARTITION BY x.id ORDER BY x.row_start, x.is_current, x.status
+                       ) AS prior_status
+                FROM (
+                    SELECT h.id, h.status, {history_user} AS user_id, h.{row_start} AS row_start,
+                           CAST(0 AS int) AS is_current
+                    FROM AuditData.claimsHistory h
+                    WHERE h.id IN (
+                        SELECT CAST(value AS int) FROM STRING_SPLIT(CAST(%(ids)s AS nvarchar(max)), ',')
+                    )
+                      {as_of_clause}
+                    UNION ALL
+                    SELECT c.id, c.status, {claims_user} AS user_id, c.{row_start} AS row_start,
+                           CAST(1 AS int) AS is_current
+                    FROM dbo.Claims c
+                    WHERE c.id IN (
+                        SELECT CAST(value AS int) FROM STRING_SPLIT(CAST(%(ids)s AS nvarchar(max)), ',')
+                    )
+                      {current_as_of_clause}
+                ) x
             ) m
-            WHERE m.id IN (
-                SELECT CAST(value AS int) FROM STRING_SPLIT(CAST(%(ids)s AS nvarchar(max)), ',')
-            )
+            WHERE LOWER(m.status) IN ({_NOT_BILLABLE_STATUS_SQL})
             ORDER BY m.id, m.marked_at
             """,
             {**params, "ids": csv},
@@ -900,6 +913,7 @@ def get_not_billable_markers(
                 markers[cid] = {
                     "user_id": row.get("user_id"),
                     "marked_at": row.get("marked_at"),
+                    "prior_status": row.get("prior_status"),
                 }
     return markers
 

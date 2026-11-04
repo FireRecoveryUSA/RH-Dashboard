@@ -717,6 +717,7 @@ async def _compute_claim_payment_comparison(
             dept_allows_direct = bool(int(dept_billing)) if dept_billing is not None else None
         except (TypeError, ValueError):
             dept_allows_direct = None
+        marked_at_dt = _parse_ts(marker["marked_at"]) if marker.get("marked_at") else None
         claim_rows.append(ClaimComparisonClaim(
             claim_id=claim_id,
             run_number=row.get("run_number"),
@@ -737,10 +738,8 @@ async def _compute_claim_payment_comparison(
             services_total=services_totals.get(claim_id),
             ever_not_billable=ever_nb,
             not_billable_by=marker.get("user_id"),
-            not_billable_at=(
-                _parse_ts(marker["marked_at"]).isoformat()
-                if marker.get("marked_at") else None
-            ),
+            not_billable_at=marked_at_dt.isoformat() if marked_at_dt else None,
+            status_when_not_billable=marker.get("prior_status"),
             submitted_at=submitted_dt.isoformat() if submitted_dt else None,
             sent_to_insurance_at=sent_insurance.isoformat() if sent_insurance else None,
             days_submitted_to_insurance=days_to_insurance,

@@ -289,6 +289,8 @@ interface DrillAgg {
   otherInvoiced: number;
   aiCollected: number;
   otherCollected: number;
+  aiSuccess: number;
+  otherSuccess: number;
   aiRate: number | null;
   otherRate: number | null;
 }
@@ -321,6 +323,8 @@ function aggregateClaims(
         otherInvoiced: other.reduce((s, c) => s + invoicedDollars(c), 0),
         aiCollected: collectedOf(ai),
         otherCollected: collectedOf(other),
+        aiSuccess: ai.filter(isSuccess).length,
+        otherSuccess: other.filter(isSuccess).length,
         aiRate: rateOf(ai),
         otherRate: rateOf(other),
       };
@@ -340,8 +344,71 @@ const departmentKey = (c: ClaimComparisonClaim): string =>
     ? `${c.department_name ?? 'Unknown'} (#${c.department_id})`
     : c.department_name ?? 'Unknown';
 
+const cohortLabel = (c: ClaimComparisonClaim): string =>
+  c.cohort === 'ai_released' ? 'AI' : (c.subtype === 'ai_rejected' ? 'AI-rejected' : 'Manual');
+
 const processorKey = (c: ClaimComparisonClaim): string =>
   c.not_billable_by != null ? `User ${c.not_billable_by}` : 'No not-billable marker';
+
+const collectedCell = (total: number, count: number): string =>
+  count > 0 ? `${money(total)} / ${money(total / count)}` : `${money(total)} / —`;
+
+const NotBillableClaimsSection: React.FC<{ claims: ClaimComparisonClaim[] }> = ({ claims }) => {
+  const marked = claims.filter((c) => c.ever_not_billable);
+  if (marked.length === 0) {
+    return (
+      <div style={{ fontSize: '12px', color: 'var(--text-muted)' }}>
+        No claims in this period were marked not-billable.
+      </div>
+    );
+  }
+  return (
+    <div style={{ overflowX: 'auto' }}>
+      <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+        <thead>
+          <tr>
+            <th style={thStyle}>Claim</th>
+            <th style={thStyle}>Cohort</th>
+            <th style={thStyle}>Department</th>
+            <th style={thStyle}>Direct billing</th>
+            <th style={thStyle}>Status when marked</th>
+            <th style={thStyle}>Marked by</th>
+            <th style={thStyle}>Marked at</th>
+            <th style={thStyle}>Line items $</th>
+            <th style={thStyle}>Submit → insurance (d)</th>
+          </tr>
+        </thead>
+        <tbody>
+          {marked.map((c) => (
+            <tr key={c.claim_id}>
+              <td style={tdStyle}>{c.run_number ?? c.claim_id}</td>
+              <td style={{ ...tdStyle, color: c.cohort === 'ai_released' ? '#22c55e' : '#ef4444' }}>
+                {cohortLabel(c)}
+              </td>
+              <td style={tdStyle}>{departmentKey(c)}</td>
+              <td style={tdStyle}>
+                {c.department_allows_direct_billing == null ? '—' : c.department_allows_direct_billing ? 'allowed' : 'not allowed'}
+              </td>
+              <td style={tdStyle}>{c.status_when_not_billable ?? '—'}</td>
+              <td style={tdStyle}>{c.not_billable_by != null ? `User ${c.not_billable_by}` : '—'}</td>
+              <td style={tdStyle}>{c.not_billable_at?.slice(0, 10) ?? '—'}</td>
+              <td style={tdStyle}>
+                {c.services_total == null ? 'none' : money(c.services_total)}
+              </td>
+              <td style={tdStyle}>{c.days_submitted_to_insurance ?? '—'}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      <div style={{ marginTop: '10px', fontSize: '11px', color: 'var(--text-muted)' }}>
+        Status when marked = the status the claim was in right before its first not-billable
+        marker. Line items $ = total of created invoice line items; claim_services has no
+        timestamps, so this shows line items that exist for the claim, not proof they
+        predated the marker.
+      </div>
+    </div>
+  );
+};
 
 const ClaimDrillDown: React.FC<{ claims: ClaimComparisonClaim[] }> = ({ claims }) => {
   const [path, setPath] = useState<DrillPath>({});
@@ -431,11 +498,11 @@ const ClaimDrillDown: React.FC<{ claims: ClaimComparisonClaim[] }> = ({ claims }
                   </td>
                   <td style={tdStyle}>{row.ai.toLocaleString()}</td>
                   <td style={tdStyle}>{money(row.aiInvoiced)}</td>
-                  <td style={tdStyle}>{money(row.aiCollected)}</td>
+                  <td style={tdStyle}>{collectedCell(row.aiCollected, row.aiSuccess)}</td>
                   <td style={tdStyle}>{row.aiRate == null ? '—' : formatPercent(row.aiRate)}</td>
                   <td style={tdStyle}>{row.other.toLocaleString()}</td>
                   <td style={tdStyle}>{money(row.otherInvoiced)}</td>
-                  <td style={tdStyle}>{money(row.otherCollected)}</td>
+                  <td style={tdStyle}>{collectedCell(row.otherCollected, row.otherSuccess)}</td>
                   <td style={tdStyle}>{row.otherRate == null ? '—' : formatPercent(row.otherRate)}</td>
                 </tr>
               ))}
@@ -474,7 +541,7 @@ const ClaimDrillDown: React.FC<{ claims: ClaimComparisonClaim[] }> = ({ claims }
                     </td>
                     <td style={tdStyle}>{c.run_number ?? c.claim_id}</td>
                     <td style={{ ...tdStyle, color: c.cohort === 'ai_released' ? '#22c55e' : '#ef4444' }}>
-                      {c.cohort === 'ai_released' ? 'AI' : (c.subtype === 'ai_rejected' ? 'AI-rejected' : 'Manual')}
+                      {cohortLabel(c)}
                     </td>
                     <td style={tdStyle}>{c.status ?? '—'}</td>
                     <td style={tdStyle}>{money(c.amount_invoiced)}</td>
@@ -511,9 +578,9 @@ const ClaimDrillDown: React.FC<{ claims: ClaimComparisonClaim[] }> = ({ claims }
         </div>
       )}
       <div style={{ marginTop: '10px', fontSize: '11px', color: 'var(--text-muted)' }}>
-        Invoiced = Claims.amount_invoiced (AI fallback: AI invoice total). Collected = invoiced $
-        on paid + ready-to-be-paid claims. Paid rate = (paid + ready) / finished claims.
-        Drill: incident type → department → insurer → processor → claims.
+        Invoiced = Claims.amount_invoiced (AI fallback: AI invoice total). Collected = total /
+        per-invoice average over paid + ready-to-be-paid claims. Paid rate = (paid + ready) /
+        finished claims. Drill: incident type → department → insurer → processor → claims.
       </div>
     </div>
   );
@@ -866,6 +933,11 @@ export const AiClaimComparisonDashboard: React.FC = () => {
       {(data.claims?.length ?? 0) > 0 && (
         <SectionCard title="Claim Detail Drill-Down">
           <ClaimDrillDown claims={data.claims} />
+        </SectionCard>
+      )}
+      {(data.claims?.length ?? 0) > 0 && (
+        <SectionCard title="Not-Billable Claims Review">
+          <NotBillableClaimsSection claims={data.claims} />
         </SectionCard>
       )}
       <NotBillableSection data={data} />
