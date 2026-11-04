@@ -494,6 +494,7 @@ export interface ClaimComparisonClaim {
   ever_not_billable: boolean;
   not_billable_by: number | null;
   not_billable_at: string | null;
+  status_when_not_billable: string | null;
   submitted_at: string | null;
   sent_to_insurance_at: string | null;
   days_submitted_to_insurance: number | null;

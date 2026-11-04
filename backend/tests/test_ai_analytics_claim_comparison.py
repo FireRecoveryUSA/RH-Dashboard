@@ -1134,6 +1134,7 @@ class TestClaimRows:
         assert c2.ever_not_billable is True
         assert c2.not_billable_by == 77
         assert c2.not_billable_at == "2026-03-05T00:00:00"
+        assert c2.status_when_not_billable == "Assigned"
         assert c2.sent_to_insurance_at is None
         assert c2.days_submitted_to_insurance is None
 
@@ -1154,3 +1155,28 @@ class TestClaimRows:
         resp = _run(scope, versions, [], extras=({}, {}, {}, False))
         assert resp.data_complete is False
         assert resp.source_status["recoveryhub_sql"] == "partial"
+
+from datetime import datetime  # noqa: E402
+
+
+class TestStatusBefore:
+    def test_picks_latest_status_started_before_moment(self):
+        v = [
+            ("Assigned", "in_progress", datetime(2026, 3, 1), False, datetime(2026, 2, 1)),
+            ("Ready to Invoice", "in_progress", datetime(2026, 3, 2), False, datetime(2026, 3, 2)),
+            ("Unbillable", "not_billable", datetime(2026, 3, 5), True, datetime(2026, 3, 5)),
+        ]
+        assert svc._status_before(v, datetime(2026, 3, 5)) == "Ready to Invoice"
+
+    def test_status_recurring_after_moment_uses_first_start(self):
+        v = [
+            ("New", "in_progress", datetime(2026, 2, 1), False, datetime(2026, 2, 1)),
+            ("Assigned", "in_progress", datetime(2026, 4, 1), True, datetime(2026, 2, 10)),
+            ("Unbillable", "not_billable", datetime(2026, 3, 5), False, datetime(2026, 3, 5)),
+        ]
+        assert svc._status_before(v, datetime(2026, 3, 5)) == "Assigned"
+
+    def test_none_without_moment_or_prior_versions(self):
+        v = [("Unbillable", "not_billable", datetime(2026, 3, 5), True, datetime(2026, 3, 5))]
+        assert svc._status_before(v, None) is None
+        assert svc._status_before(v, datetime(2026, 3, 5)) is None

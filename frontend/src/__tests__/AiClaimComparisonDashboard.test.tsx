@@ -1,5 +1,5 @@
 import { describe, test, expect, vi, beforeEach } from 'vitest';
-import { render, screen, waitFor, fireEvent } from '@testing-library/react';
+import { render, screen, waitFor, fireEvent, within } from '@testing-library/react';
 import React from 'react';
 import { AiClaimComparisonDashboard } from '../components/ai/AiClaimComparisonDashboard';
 
@@ -128,6 +128,7 @@ const COMPARISON = {
       ever_not_billable: false,
       not_billable_by: null,
       not_billable_at: null,
+      status_when_not_billable: null,
       submitted_at: '2026-02-10T00:00:00',
       sent_to_insurance_at: '2026-03-01T00:00:00',
       days_submitted_to_insurance: 19,
@@ -153,6 +154,7 @@ const COMPARISON = {
       ever_not_billable: true,
       not_billable_by: 77,
       not_billable_at: '2026-03-05T00:00:00',
+      status_when_not_billable: 'Assigned',
       submitted_at: '2026-02-12T00:00:00',
       sent_to_insurance_at: '2026-03-06T00:00:00',
       days_submitted_to_insurance: 22,
@@ -288,35 +290,54 @@ describe('AiClaimComparisonDashboard', () => {
     render(<AiClaimComparisonDashboard />);
     await waitFor(() => expect(screen.getByText('Claim Detail Drill-Down')).toBeInTheDocument());
 
+    const drill = within(screen.getByText('Claim Detail Drill-Down').parentElement as HTMLElement);
     // Level 1: aggregation by incident type
-    expect(screen.getAllByText('Motor Vehicle Incident').length).toBeGreaterThan(0);
-    expect(screen.getByText('All incident types')).toBeInTheDocument();
+    expect(drill.getAllByText('Motor Vehicle Incident').length).toBeGreaterThan(0);
+    expect(drill.getByText('All incident types')).toBeInTheDocument();
     // Collected-$ breakdown columns are present on every drill level
-    expect(screen.getByText('AI collected')).toBeInTheDocument();
-    expect(screen.getByText('Other collected')).toBeInTheDocument();
-    fireEvent.click(screen.getByRole('button', { name: /Motor Vehicle Incident/ }));
+    expect(drill.getByText('AI collected')).toBeInTheDocument();
+    expect(drill.getByText('Other collected')).toBeInTheDocument();
+    fireEvent.click(drill.getByRole('button', { name: /Motor Vehicle Incident/ }));
 
     // Level 2: departments within the incident (grouped by dept id)
-    await waitFor(() => expect(screen.getByText('Dept A (#7)')).toBeInTheDocument());
-    expect(screen.getByText('Dept B (#8)')).toBeInTheDocument();
-    fireEvent.click(screen.getByText('Dept A (#7)'));
+    await waitFor(() => expect(drill.getByText('Dept A (#7)')).toBeInTheDocument());
+    expect(drill.getByText('Dept B (#8)')).toBeInTheDocument();
+    fireEvent.click(drill.getByText('Dept A (#7)'));
 
     // Level 3: insurers within the department
-    await waitFor(() => expect(screen.getAllByText('Acme Ins').length).toBeGreaterThan(0));
-    fireEvent.click(screen.getAllByText('Acme Ins')[0]);
+    await waitFor(() => expect(drill.getAllByText('Acme Ins').length).toBeGreaterThan(0));
+    fireEvent.click(drill.getAllByText('Acme Ins')[0]);
 
     // Level 4: processors within the insurer (not-billable marker user)
-    await waitFor(() => expect(screen.getByText('No not-billable marker')).toBeInTheDocument());
-    fireEvent.click(screen.getByText('No not-billable marker'));
+    await waitFor(() => expect(drill.getByText('No not-billable marker')).toBeInTheDocument());
+    fireEvent.click(drill.getByText('No not-billable marker'));
 
     // Level 5: claim rows for the AI claim under Dept A / Acme Ins
-    await waitFor(() => expect(screen.getByText('R100')).toBeInTheDocument());
-    expect(screen.queryByText('R200')).not.toBeInTheDocument();
+    await waitFor(() => expect(drill.getByText('R100')).toBeInTheDocument());
+    expect(drill.queryByText('R200')).not.toBeInTheDocument();
 
     // Expanded row shows per-claim details
-    fireEvent.click(screen.getByLabelText('Toggle claim 1 detail'));
-    await waitFor(() => expect(screen.getByText('INV-1')).toBeInTheDocument());
-    expect(screen.getByText('Jane')).toBeInTheDocument();
-    expect(screen.getByText('19')).toBeInTheDocument();
+    fireEvent.click(drill.getByLabelText('Toggle claim 1 detail'));
+    await waitFor(() => expect(drill.getByText('INV-1')).toBeInTheDocument());
+    expect(drill.getByText('Jane')).toBeInTheDocument();
+    expect(drill.getByText('19')).toBeInTheDocument();
+  });
+
+  test('shows collected totals with per-invoice averages and the not-billable review', async () => {
+    render(<AiClaimComparisonDashboard />);
+    await waitFor(() => expect(screen.getByText('Claim Detail Drill-Down')).toBeInTheDocument());
+    // AI collected $1,200 over 1 paid/ready claim -> $1,200 / $1,200
+    expect(screen.getByText('$1,200 / $1,200')).toBeInTheDocument();
+    // Other's only claim was denied -> $0 / —
+    expect(screen.getByText('$0 / —')).toBeInTheDocument();
+
+    // Not-billable review lists the marked claim with its context
+    const review = within(screen.getByText('Not-Billable Claims Review').parentElement as HTMLElement);
+    expect(review.getByText('R200')).toBeInTheDocument();
+    expect(review.queryByText('R100')).not.toBeInTheDocument();
+    expect(review.getByText('Assigned')).toBeInTheDocument();
+    expect(review.getByText('User 77')).toBeInTheDocument();
+    expect(review.getByText('not allowed')).toBeInTheDocument();
+    expect(review.getByText('$800')).toBeInTheDocument();
   });
 });
