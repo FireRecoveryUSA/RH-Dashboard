@@ -297,26 +297,32 @@ def _fetch_claim_extras(
     claim_ids: List[int],
     row_start_column: str,
     as_of: Optional[datetime] = None,
-) -> Tuple[Dict[int, float], Dict[int, Dict[str, Optional[str]]], Dict[int, Dict[str, Any]]]:
+) -> Tuple[Dict[int, float], Dict[int, Dict[str, Optional[str]]], Dict[int, Dict[str, Any]], bool]:
     """Per-claim extras for the drill-down rows: line-item totals, adjusters,
-    and who/when marked not-billable. Sync; called via asyncio.to_thread.
-    Each query degrades independently so one failure keeps the others' data."""
+    and who/when marked not-billable, plus an all-queries-ok flag. Sync;
+    called via asyncio.to_thread. Each query degrades independently, and the
+    flag lets the caller mark the comparison partial when any extras read
+    failed so the warmer never publishes missing details as complete."""
     totals: Dict[int, float] = {}
     adjusters: Dict[int, Dict[str, Optional[str]]] = {}
     markers: Dict[int, Dict[str, Any]] = {}
+    ok = True
     try:
         totals = sql_repo.get_claim_services_totals(claim_ids)
     except Exception as e:
+        ok = False
         logger.error(f"claim_services totals query failed: {e}")
     try:
         adjusters = sql_repo.get_claim_adjusters(claim_ids)
     except Exception as e:
+        ok = False
         logger.error(f"adjusters query failed: {e}")
     try:
         markers = sql_repo.get_not_billable_markers(claim_ids, row_start_column, as_of)
     except Exception as e:
+        ok = False
         logger.error(f"not-billable markers query failed: {e}")
-    return totals, adjusters, markers
+    return totals, adjusters, markers, ok
 
 
 def _first_insurance_start(
@@ -652,9 +658,12 @@ async def _compute_claim_payment_comparison(
     adjusters: Dict[int, Dict[str, Optional[str]]] = {}
     nb_markers: Dict[int, Dict[str, Any]] = {}
     try:
-        services_totals, adjusters, nb_markers = await asyncio.to_thread(
+        services_totals, adjusters, nb_markers, extras_ok = await asyncio.to_thread(
             _fetch_claim_extras, tracked_ids, row_start_column, as_of,
         )
+        if not extras_ok:
+            source_status["recoveryhub_sql"] = "partial"
+            data_complete = False
     except Exception as e:
         logger.error(f"Claim comparison claim-extras query failed: {e}")
         source_status["recoveryhub_sql"] = "partial"

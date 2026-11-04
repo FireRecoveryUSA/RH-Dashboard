@@ -195,7 +195,7 @@ def _run(scope_rows, versions_rows, records=None, deleted=0, ai_complete=True,
         return [r for r in versions_rows if r["id"] in chunk]
 
     if extras is None:
-        extras = ({}, {}, {})
+        extras = ({}, {}, {}, True)
     with patch(f"{SQL}.get_claims_row_start_column", return_value=ROW_START), \
          patch(f"{SQL}.get_claim_comparison_scope", return_value=scope_rows), \
          patch(f"{SQL}.get_claim_status_versions", side_effect=fake_versions), \
@@ -1106,6 +1106,7 @@ class TestClaimRows:
             {1: 1100.0, 2: 0.0},
             {1: {"insurance_company": "Acme Ins", "adjuster_name": "Jane"}},
             {2: {"user_id": 77, "marked_at": "2026-03-05T00:00:00"}},
+            True,
         )
         resp = _run(scope, versions, records, extras=extras)
         rows = {c.claim_id: c for c in resp.claims}
@@ -1146,3 +1147,10 @@ class TestClaimRows:
         assert row.insurance_company is None
         assert row.services_total is None
         assert row.department_allows_direct_billing is None
+
+    def test_failed_extras_marks_comparison_partial(self):
+        scope = [_scope_row(3, dept=9)]
+        versions = _versions(3, ("Assigned", "2026-02-12T00:00:00"))
+        resp = _run(scope, versions, [], extras=({}, {}, {}, False))
+        assert resp.data_complete is False
+        assert resp.source_status["recoveryhub_sql"] == "partial"
