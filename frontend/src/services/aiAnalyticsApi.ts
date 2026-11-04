@@ -493,6 +493,7 @@ export interface ClaimComparisonClaim {
   services_total: number | null;
   ever_not_billable: boolean;
   not_billable_by: number | null;
+  not_billable_by_name: string | null;
   not_billable_at: string | null;
   status_when_not_billable: string | null;
   submitted_at: string | null;

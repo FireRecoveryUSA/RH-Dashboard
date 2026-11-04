@@ -41,6 +41,47 @@ const WEEK_COUNTS = (overrides: Record<string, number | null> = {}) => ({
   ...overrides,
 });
 
+type MarkedClaimOverrides = Partial<{
+  claim_id: number;
+  run_number: string;
+  invoice_number: string;
+  amount_invoiced: number;
+  services_total: number | null;
+  department_allows_direct_billing: boolean;
+  not_billable_by: number | null;
+  not_billable_by_name: string | null;
+  status_when_not_billable: string;
+}>;
+
+const markedClaim = (overrides: MarkedClaimOverrides = {}) => ({
+  claim_id: 2,
+  run_number: 'R200',
+  cohort: 'other' as const,
+  subtype: 'manual' as const,
+  department_id: 8,
+  department_name: 'Dept B',
+  department_allows_direct_billing: false,
+  incident: 'Motor Vehicle Incident',
+  status: 'Denied',
+  bucket: 'denied',
+  billing_target: 'insurance' as const,
+  insurance_company: 'Acme Ins',
+  adjuster_name: 'Bob',
+  invoice_number: 'INV-2',
+  amount_invoiced: 800,
+  ai_invoice_total: null,
+  services_total: 800,
+  ever_not_billable: true,
+  not_billable_by: 77,
+  not_billable_by_name: 'Pat Smith',
+  not_billable_at: '2026-03-05T00:00:00',
+  status_when_not_billable: 'Assigned',
+  submitted_at: '2026-02-12T00:00:00',
+  sent_to_insurance_at: '2026-03-06T00:00:00',
+  days_submitted_to_insurance: 22,
+  ...overrides,
+});
+
 const COMPARISON = {
   period_start: '2026-01-01',
   period_end: '2026-08-13',
@@ -127,38 +168,42 @@ const COMPARISON = {
       services_total: 1100,
       ever_not_billable: false,
       not_billable_by: null,
+      not_billable_by_name: null,
       not_billable_at: null,
       status_when_not_billable: null,
       submitted_at: '2026-02-10T00:00:00',
       sent_to_insurance_at: '2026-03-01T00:00:00',
       days_submitted_to_insurance: 19,
     },
-    {
-      claim_id: 2,
-      run_number: 'R200',
-      cohort: 'other',
-      subtype: 'manual',
-      department_id: 8,
-      department_name: 'Dept B',
-      department_allows_direct_billing: false,
-      incident: 'Motor Vehicle Incident',
-      status: 'Denied',
-      bucket: 'denied',
-      billing_target: 'insurance',
-      insurance_company: 'Acme Ins',
-      adjuster_name: 'Bob',
-      invoice_number: 'INV-2',
-      amount_invoiced: 800,
-      ai_invoice_total: null,
-      services_total: 800,
-      ever_not_billable: true,
-      not_billable_by: 77,
-      not_billable_at: '2026-03-05T00:00:00',
-      status_when_not_billable: 'Assigned',
-      submitted_at: '2026-02-12T00:00:00',
-      sent_to_insurance_at: '2026-03-06T00:00:00',
-      days_submitted_to_insurance: 22,
-    },
+    markedClaim(),
+    markedClaim({
+      claim_id: 3,
+      run_number: 'R300',
+      invoice_number: 'INV-3',
+      amount_invoiced: 300,
+      services_total: 300,
+      department_allows_direct_billing: true,
+      status_when_not_billable: 'Queued',
+    }),
+    markedClaim({
+      claim_id: 4,
+      run_number: 'R400',
+      invoice_number: 'INV-4',
+      amount_invoiced: 450,
+      services_total: 450,
+      not_billable_by: 88,
+      not_billable_by_name: null,
+      status_when_not_billable: 'Review',
+    }),
+    markedClaim({
+      claim_id: 5,
+      run_number: 'R500',
+      invoice_number: 'INV-5',
+      amount_invoiced: 0,
+      services_total: null,
+      not_billable_by: null,
+      not_billable_by_name: null,
+    }),
   ],
   unmapped_statuses: {},
   resolved_columns: { claims_row_start: 'SysStartTime' },
@@ -323,6 +368,20 @@ describe('AiClaimComparisonDashboard', () => {
     expect(drill.getByText('19')).toBeInTheDocument();
   });
 
+  test('uses the marker user name in the processor drill-down', async () => {
+    render(<AiClaimComparisonDashboard />);
+    await waitFor(() => expect(screen.getByText('Claim Detail Drill-Down')).toBeInTheDocument());
+    const drill = within(screen.getByText('Claim Detail Drill-Down').parentElement as HTMLElement);
+    fireEvent.click(drill.getByRole('button', { name: /Motor Vehicle Incident/ }));
+    fireEvent.click(await drill.findByText('Dept B (#8)'));
+    fireEvent.click((await drill.findAllByText('Acme Ins'))[0]);
+    expect(await drill.findByText('Pat Smith (#77)')).toBeInTheDocument();
+    fireEvent.click(drill.getByText('Pat Smith (#77)'));
+    expect(await drill.findByText('R200')).toBeInTheDocument();
+    expect(drill.getByRole('columnheader', { name: 'Days submitted → sent to insurance' }))
+      .toHaveAttribute('title', 'Days from when the claim was submitted to us until its invoice was sent to the insurance company');
+  });
+
   test('shows collected totals with per-invoice averages and the not-billable review', async () => {
     render(<AiClaimComparisonDashboard />);
     await waitFor(() => expect(screen.getByText('Claim Detail Drill-Down')).toBeInTheDocument());
@@ -331,14 +390,34 @@ describe('AiClaimComparisonDashboard', () => {
     // Other's only claim was denied -> $0 / —
     expect(screen.getByText('$0 / —')).toBeInTheDocument();
 
-    // Not-billable review lists the marked claim with its context
+    // Not-billable groups start collapsed and summarize claims and line items.
     const review = within(screen.getByText('Not-Billable Claims Review').parentElement as HTMLElement);
-    expect(review.getByText('R200')).toBeInTheDocument();
+    expect(review.getByText('Pat Smith (#77) · 2 claims · $1,100')).toBeInTheDocument();
+    expect(review.getByText('User 88 · 1 claim · $450')).toBeInTheDocument();
+    expect(review.getByText('No user recorded · 1 claim · $0')).toBeInTheDocument();
+    expect(review.getAllByRole('button', { name: /^Toggle not-billable group/ }).map((button) => button.getAttribute('aria-label')))
+      .toEqual([
+        'Toggle not-billable group Pat Smith (#77)',
+        'Toggle not-billable group User 88',
+        'Toggle not-billable group No user recorded',
+      ]);
+    expect(review.queryByText('R200')).not.toBeInTheDocument();
+    expect(review.queryByText('R400')).not.toBeInTheDocument();
+    expect(review.queryByText('R500')).not.toBeInTheDocument();
     expect(review.queryByText('R100')).not.toBeInTheDocument();
+    fireEvent.click(review.getByRole('button', { name: 'Toggle not-billable group Pat Smith (#77)' }));
+    expect(review.getByText('R200')).toBeInTheDocument();
+    expect(review.getByText('R300')).toBeInTheDocument();
     expect(review.getByText('Assigned')).toBeInTheDocument();
-    expect(review.getByText('User 77')).toBeInTheDocument();
     expect(review.getByText('not allowed')).toBeInTheDocument();
     expect(review.getByText('$800')).toBeInTheDocument();
+    expect(review.getByRole('columnheader', { name: 'Days submitted → sent to insurance' }))
+      .toHaveAttribute('title', 'Days from when the claim was submitted to us until its invoice was sent to the insurance company');
+
+    fireEvent.click(review.getByRole('button', { name: 'Expand all' }));
+    expect(review.getByText('R400')).toBeInTheDocument();
+    expect(review.getByText('R500')).toBeInTheDocument();
+    expect(review.getByRole('button', { name: 'Collapse all' })).toBeInTheDocument();
   });
 
   test('shows the not-billable review empty state when no claims were marked', async () => {

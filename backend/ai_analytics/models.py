@@ -417,6 +417,7 @@ class ClaimComparisonClaim(BaseModel):
     services_total: Optional[float] = None
     ever_not_billable: bool = False
     not_billable_by: Optional[int] = None
+    not_billable_by_name: Optional[str] = None
     not_billable_at: Optional[str] = None
     status_when_not_billable: Optional[str] = None
     submitted_at: Optional[str] = None

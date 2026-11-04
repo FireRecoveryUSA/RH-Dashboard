@@ -69,6 +69,8 @@ const sectionTitleStyle: React.CSSProperties = {
 };
 
 const pct = (value: number | null): string => (value === null ? '—' : formatPercent(value));
+const DAYS_SUBMITTED_TOOLTIP =
+  'Days from when the claim was submitted to us until its invoice was sent to the insurance company';
 
 // Shares are over the whole displayed population: `total` covers only
 // finished claims, so the other displayed buckets are added back.
@@ -347,13 +349,18 @@ const departmentKey = (c: ClaimComparisonClaim): string =>
 const cohortLabel = (c: ClaimComparisonClaim): string =>
   c.cohort === 'ai_released' ? 'AI' : (c.subtype === 'ai_rejected' ? 'AI-rejected' : 'Manual');
 
+const markerUserLabel = (c: ClaimComparisonClaim): string =>
+  c.not_billable_by == null ? 'No user recorded'
+    : c.not_billable_by_name ? `${c.not_billable_by_name} (#${c.not_billable_by})` : `User ${c.not_billable_by}`;
+
 const processorKey = (c: ClaimComparisonClaim): string =>
-  c.not_billable_by != null ? `User ${c.not_billable_by}` : 'No not-billable marker';
+  c.not_billable_by != null ? markerUserLabel(c) : 'No not-billable marker';
 
 const collectedCell = (total: number, count: number): string =>
   count > 0 ? `${money(total)} / ${money(total / count)}` : `${money(total)} / —`;
 
 const NotBillableClaimsSection: React.FC<{ claims: ClaimComparisonClaim[] }> = ({ claims }) => {
+  const [expandedGroups, setExpandedGroups] = useState<Set<string>>(() => new Set());
   const marked = claims.filter((c) => c.ever_not_billable);
   if (marked.length === 0) {
     return (
@@ -362,8 +369,43 @@ const NotBillableClaimsSection: React.FC<{ claims: ClaimComparisonClaim[] }> = (
       </div>
     );
   }
+  const claimsByUser = new Map<number | null, ClaimComparisonClaim[]>();
+  for (const claim of marked) {
+    const userId = claim.not_billable_by ?? null;
+    const group = claimsByUser.get(userId) ?? [];
+    group.push(claim);
+    claimsByUser.set(userId, group);
+  }
+  const groups = Array.from(claimsByUser, ([userId, userClaims]) => ({
+    key: userId == null ? 'no-user' : `user-${userId}`,
+    userId,
+    label: markerUserLabel(userClaims[0]),
+    claims: userClaims,
+  })).sort((a, b) => {
+    if (a.userId == null) return b.userId == null ? 0 : 1;
+    if (b.userId == null) return -1;
+    return b.claims.length - a.claims.length || a.label.localeCompare(b.label);
+  });
+  const allExpanded = groups.length > 0 && groups.every((group) => expandedGroups.has(group.key));
+  const toggleGroup = (key: string) => {
+    setExpandedGroups((current) => {
+      const next = new Set(current);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  };
   return (
     <div style={{ overflowX: 'auto' }}>
+      <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: '8px' }}>
+        <button
+          type="button"
+          onClick={() => setExpandedGroups(allExpanded ? new Set<string>() : new Set(groups.map((group) => group.key)))}
+          style={{ border: 0, background: 'none', color: 'var(--accent-color)', cursor: 'pointer', fontSize: '12px' }}
+        >
+          {allExpanded ? 'Collapse all' : 'Expand all'}
+        </button>
+      </div>
       <table style={{ width: '100%', borderCollapse: 'collapse' }}>
         <thead>
           <tr>
@@ -372,32 +414,68 @@ const NotBillableClaimsSection: React.FC<{ claims: ClaimComparisonClaim[] }> = (
             <th style={thStyle}>Department</th>
             <th style={thStyle}>Direct billing</th>
             <th style={thStyle}>Status when marked</th>
-            <th style={thStyle}>Marked by</th>
             <th style={thStyle}>Marked at</th>
             <th style={thStyle}>Line items $</th>
-            <th style={thStyle}>Submit → insurance (d)</th>
+            <th style={thStyle} title={DAYS_SUBMITTED_TOOLTIP}>Days submitted → sent to insurance</th>
           </tr>
         </thead>
         <tbody>
-          {marked.map((c) => (
-            <tr key={c.claim_id}>
-              <td style={tdStyle}>{c.run_number ?? c.claim_id}</td>
-              <td style={{ ...tdStyle, color: c.cohort === 'ai_released' ? '#22c55e' : '#ef4444' }}>
-                {cohortLabel(c)}
-              </td>
-              <td style={tdStyle}>{departmentKey(c)}</td>
-              <td style={tdStyle}>
-                {c.department_allows_direct_billing == null ? '—' : c.department_allows_direct_billing ? 'allowed' : 'not allowed'}
-              </td>
-              <td style={tdStyle}>{c.status_when_not_billable ?? '—'}</td>
-              <td style={tdStyle}>{c.not_billable_by != null ? `User ${c.not_billable_by}` : '—'}</td>
-              <td style={tdStyle}>{c.not_billable_at?.slice(0, 10) ?? '—'}</td>
-              <td style={tdStyle}>
-                {c.services_total == null ? 'none' : money(c.services_total)}
-              </td>
-              <td style={tdStyle}>{c.days_submitted_to_insurance ?? '—'}</td>
-            </tr>
-          ))}
+          {groups.map((group) => {
+            const isExpanded = expandedGroups.has(group.key);
+            const total = group.claims.reduce((sum, claim) => sum + (claim.services_total ?? 0), 0);
+            return (
+              <React.Fragment key={group.key}>
+                <tr>
+                  <td
+                    colSpan={8}
+                    style={{ ...tdStyle, padding: '8px 12px', background: 'var(--bg-secondary, rgba(128,128,128,0.08))' }}
+                  >
+                    <button
+                      type="button"
+                      aria-label={`Toggle not-billable group ${group.label}`}
+                      aria-expanded={isExpanded}
+                      onClick={() => toggleGroup(group.key)}
+                      style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: '6px',
+                        width: '100%',
+                        border: 0,
+                        padding: 0,
+                        background: 'none',
+                        color: 'var(--text-primary)',
+                        cursor: 'pointer',
+                        font: 'inherit',
+                        fontWeight: 700,
+                        textAlign: 'left',
+                      }}
+                    >
+                      {isExpanded ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
+                      {group.label} · {group.claims.length} {group.claims.length === 1 ? 'claim' : 'claims'} · {money(total)}
+                    </button>
+                  </td>
+                </tr>
+                {isExpanded && group.claims.map((c) => (
+                  <tr key={c.claim_id}>
+                    <td style={tdStyle}>{c.run_number ?? c.claim_id}</td>
+                    <td style={{ ...tdStyle, color: c.cohort === 'ai_released' ? '#22c55e' : '#ef4444' }}>
+                      {cohortLabel(c)}
+                    </td>
+                    <td style={tdStyle}>{departmentKey(c)}</td>
+                    <td style={tdStyle}>
+                      {c.department_allows_direct_billing == null ? '—' : c.department_allows_direct_billing ? 'allowed' : 'not allowed'}
+                    </td>
+                    <td style={tdStyle}>{c.status_when_not_billable ?? '—'}</td>
+                    <td style={tdStyle}>{c.not_billable_at?.slice(0, 10) ?? '—'}</td>
+                    <td style={tdStyle}>
+                      {c.services_total == null ? 'none' : money(c.services_total)}
+                    </td>
+                    <td style={tdStyle}>{c.days_submitted_to_insurance ?? '—'}</td>
+                  </tr>
+                ))}
+              </React.Fragment>
+            );
+          })}
         </tbody>
       </table>
       <div style={{ marginTop: '10px', fontSize: '11px', color: 'var(--text-muted)' }}>
@@ -523,7 +601,7 @@ const ClaimDrillDown: React.FC<{ claims: ClaimComparisonClaim[] }> = ({ claims }
                 <th style={thStyle}>AI total</th>
                 <th style={thStyle}>Services total</th>
                 <th style={thStyle}>Not billable by</th>
-                <th style={thStyle}>Submit → insurance (d)</th>
+                <th style={thStyle} title={DAYS_SUBMITTED_TOOLTIP}>Days submitted → sent to insurance</th>
               </tr>
             </thead>
             <tbody>
