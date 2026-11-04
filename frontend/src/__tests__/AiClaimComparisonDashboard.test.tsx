@@ -291,6 +291,9 @@ describe('AiClaimComparisonDashboard', () => {
     // Level 1: aggregation by incident type
     expect(screen.getAllByText('Motor Vehicle Incident').length).toBeGreaterThan(0);
     expect(screen.getByText('All incident types')).toBeInTheDocument();
+    // Collected-$ breakdown columns are present on every drill level
+    expect(screen.getByText('AI collected')).toBeInTheDocument();
+    expect(screen.getByText('Other collected')).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: /Motor Vehicle Incident/ }));
 
     // Level 2: departments within the incident (grouped by dept id)
@@ -302,7 +305,11 @@ describe('AiClaimComparisonDashboard', () => {
     await waitFor(() => expect(screen.getAllByText('Acme Ins').length).toBeGreaterThan(0));
     fireEvent.click(screen.getAllByText('Acme Ins')[0]);
 
-    // Level 4: claim rows for the AI claim under Dept A / Acme Ins
+    // Level 4: processors within the insurer (not-billable marker user)
+    await waitFor(() => expect(screen.getByText('No not-billable marker')).toBeInTheDocument());
+    fireEvent.click(screen.getByText('No not-billable marker'));
+
+    // Level 5: claim rows for the AI claim under Dept A / Acme Ins
     await waitFor(() => expect(screen.getByText('R100')).toBeInTheDocument());
     expect(screen.queryByText('R200')).not.toBeInTheDocument();
 

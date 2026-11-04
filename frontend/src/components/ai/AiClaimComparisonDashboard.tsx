@@ -287,6 +287,8 @@ interface DrillAgg {
   other: number;
   aiInvoiced: number;
   otherInvoiced: number;
+  aiCollected: number;
+  otherCollected: number;
   aiRate: number | null;
   otherRate: number | null;
 }
@@ -305,6 +307,8 @@ function aggregateClaims(
     const fin = list.filter(isFinished).length;
     return fin > 0 ? (list.filter(isSuccess).length / fin) * 100 : null;
   };
+  const collectedOf = (list: ClaimComparisonClaim[]) =>
+    list.filter(isSuccess).reduce((s, c) => s + invoicedDollars(c), 0);
   return [...groups.entries()]
     .map(([label, list]) => {
       const ai = list.filter((c) => c.cohort === 'ai_released');
@@ -315,6 +319,8 @@ function aggregateClaims(
         other: other.length,
         aiInvoiced: ai.reduce((s, c) => s + invoicedDollars(c), 0),
         otherInvoiced: other.reduce((s, c) => s + invoicedDollars(c), 0),
+        aiCollected: collectedOf(ai),
+        otherCollected: collectedOf(other),
         aiRate: rateOf(ai),
         otherRate: rateOf(other),
       };
@@ -326,12 +332,16 @@ interface DrillPath {
   incident?: string;
   department?: string;
   insurer?: string;
+  processor?: string;
 }
 
 const departmentKey = (c: ClaimComparisonClaim): string =>
   c.department_id != null
     ? `${c.department_name ?? 'Unknown'} (#${c.department_id})`
     : c.department_name ?? 'Unknown';
+
+const processorKey = (c: ClaimComparisonClaim): string =>
+  c.not_billable_by != null ? `User ${c.not_billable_by}` : 'No not-billable marker';
 
 const ClaimDrillDown: React.FC<{ claims: ClaimComparisonClaim[] }> = ({ claims }) => {
   const [path, setPath] = useState<DrillPath>({});
@@ -341,9 +351,10 @@ const ClaimDrillDown: React.FC<{ claims: ClaimComparisonClaim[] }> = ({ claims }
     (path.incident === undefined || c.incident === path.incident)
     && (path.department === undefined || departmentKey(c) === path.department)
     && (path.insurer === undefined || (c.insurance_company ?? 'Unknown') === path.insurer)
+    && (path.processor === undefined || processorKey(c) === path.processor)
   ), [claims, path]);
 
-  const atClaims = path.insurer !== undefined;
+  const atClaims = path.processor !== undefined;
 
   const agg = useMemo(() => {
     if (path.incident === undefined) {
@@ -352,7 +363,10 @@ const ClaimDrillDown: React.FC<{ claims: ClaimComparisonClaim[] }> = ({ claims }
     if (path.department === undefined) {
       return aggregateClaims(visible, departmentKey);
     }
-    return aggregateClaims(visible, (c) => c.insurance_company ?? 'Unknown');
+    if (path.insurer === undefined) {
+      return aggregateClaims(visible, (c) => c.insurance_company ?? 'Unknown');
+    }
+    return aggregateClaims(visible, processorKey);
   }, [visible, path]);
 
   const linkStyle: React.CSSProperties = {
@@ -364,7 +378,8 @@ const ClaimDrillDown: React.FC<{ claims: ClaimComparisonClaim[] }> = ({ claims }
     { label: 'All incident types', clear: () => setPath({}) },
     ...(path.incident !== undefined ? [{ label: path.incident, clear: () => setPath({ incident: path.incident }) }] : []),
     ...(path.department !== undefined ? [{ label: path.department, clear: () => setPath({ incident: path.incident, department: path.department }) }] : []),
-    ...(path.insurer !== undefined ? [{ label: path.insurer, clear: () => setPath(path) }] : []),
+    ...(path.insurer !== undefined ? [{ label: path.insurer, clear: () => setPath({ incident: path.incident, department: path.department, insurer: path.insurer }) }] : []),
+    ...(path.processor !== undefined ? [{ label: path.processor, clear: () => setPath(path) }] : []),
   ];
 
   return (
@@ -384,13 +399,17 @@ const ClaimDrillDown: React.FC<{ claims: ClaimComparisonClaim[] }> = ({ claims }
               <tr>
                 <th style={thStyle}>
                   {path.incident === undefined ? 'Incident type'
-                    : path.department === undefined ? 'Department' : 'Insurance company'}
+                    : path.department === undefined ? 'Department'
+                    : path.insurer === undefined ? 'Insurance company'
+                    : 'Processor (marked not-billable)'}
                 </th>
                 <th style={thStyle}>AI claims</th>
                 <th style={thStyle}>AI invoiced</th>
+                <th style={thStyle}>AI collected</th>
                 <th style={thStyle}>AI paid rate</th>
                 <th style={thStyle}>Other claims</th>
                 <th style={thStyle}>Other invoiced</th>
+                <th style={thStyle}>Other collected</th>
                 <th style={thStyle}>Other paid rate</th>
               </tr>
             </thead>
@@ -403,7 +422,8 @@ const ClaimDrillDown: React.FC<{ claims: ClaimComparisonClaim[] }> = ({ claims }
                       onClick={() => {
                         if (path.incident === undefined) setPath({ incident: row.label });
                         else if (path.department === undefined) setPath({ ...path, department: row.label });
-                        else setPath({ ...path, insurer: row.label });
+                        else if (path.insurer === undefined) setPath({ ...path, insurer: row.label });
+                        else setPath({ ...path, processor: row.label });
                       }}
                     >
                       {row.label} <ChevronRight size={11} style={{ verticalAlign: '-1px' }} />
@@ -411,9 +431,11 @@ const ClaimDrillDown: React.FC<{ claims: ClaimComparisonClaim[] }> = ({ claims }
                   </td>
                   <td style={tdStyle}>{row.ai.toLocaleString()}</td>
                   <td style={tdStyle}>{money(row.aiInvoiced)}</td>
+                  <td style={tdStyle}>{money(row.aiCollected)}</td>
                   <td style={tdStyle}>{row.aiRate == null ? '—' : formatPercent(row.aiRate)}</td>
                   <td style={tdStyle}>{row.other.toLocaleString()}</td>
                   <td style={tdStyle}>{money(row.otherInvoiced)}</td>
+                  <td style={tdStyle}>{money(row.otherCollected)}</td>
                   <td style={tdStyle}>{row.otherRate == null ? '—' : formatPercent(row.otherRate)}</td>
                 </tr>
               ))}
@@ -489,8 +511,9 @@ const ClaimDrillDown: React.FC<{ claims: ClaimComparisonClaim[] }> = ({ claims }
         </div>
       )}
       <div style={{ marginTop: '10px', fontSize: '11px', color: 'var(--text-muted)' }}>
-        Invoiced = Claims.amount_invoiced (AI fallback: AI invoice total). Paid rate =
-        (paid + ready) / finished claims. Drill: incident type → department → insurer → claims.
+        Invoiced = Claims.amount_invoiced (AI fallback: AI invoice total). Collected = invoiced $
+        on paid + ready-to-be-paid claims. Paid rate = (paid + ready) / finished claims.
+        Drill: incident type → department → insurer → processor → claims.
       </div>
     </div>
   );
