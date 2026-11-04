@@ -473,6 +473,32 @@ export interface ClaimComparisonNotBillable {
   identified_by_system: number;
 }
 
+export interface ClaimComparisonClaim {
+  claim_id: number;
+  run_number: string | null;
+  cohort: 'ai_released' | 'other';
+  subtype: 'manual' | 'ai_rejected' | null;
+  department_id: number | null;
+  department_name: string | null;
+  department_allows_direct_billing: boolean | null;
+  incident: string;
+  status: string | null;
+  bucket: string | null;
+  billing_target: 'direct' | 'insurance' | 'unknown';
+  insurance_company: string | null;
+  adjuster_name: string | null;
+  invoice_number: string | null;
+  amount_invoiced: number | null;
+  ai_invoice_total: number | null;
+  services_total: number | null;
+  ever_not_billable: boolean;
+  not_billable_by: number | null;
+  not_billable_at: string | null;
+  submitted_at: string | null;
+  sent_to_insurance_at: string | null;
+  days_submitted_to_insurance: number | null;
+}
+
 export interface AiClaimComparisonResponse {
   period_start: string;
   period_end: string;
@@ -488,6 +514,7 @@ export interface AiClaimComparisonResponse {
   by_incident_type: ClaimComparisonSegment[];
   by_billing_target: ClaimComparisonSegment[];
   not_billable: ClaimComparisonNotBillable;
+  claims: ClaimComparisonClaim[];
   unmapped_statuses: Record<string, number>;
   resolved_columns: Record<string, string | null>;
   source_status: Record<string, string>;

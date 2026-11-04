@@ -187,16 +187,20 @@ def _ai_result(records=None, complete=True):
     )
 
 
-def _run(scope_rows, versions_rows, records=None, deleted=0, ai_complete=True):
+def _run(scope_rows, versions_rows, records=None, deleted=0, ai_complete=True,
+         extras=None):
     """Run the service with SQL and AI cohort mocked."""
     def fake_versions(chunk, column, as_of=None):
         assert column == ROW_START
         return [r for r in versions_rows if r["id"] in chunk]
 
+    if extras is None:
+        extras = ({}, {}, {}, True)
     with patch(f"{SQL}.get_claims_row_start_column", return_value=ROW_START), \
          patch(f"{SQL}.get_claim_comparison_scope", return_value=scope_rows), \
          patch(f"{SQL}.get_claim_status_versions", side_effect=fake_versions), \
          patch(f"{SQL}.get_deleted_runs_count", return_value=deleted), \
+         patch(f"{SERVICE}._fetch_claim_extras", return_value=extras), \
          patch(f"{SERVICE}._load_normalized_cohort", new_callable=AsyncMock,
                return_value=_ai_result(records, ai_complete)):
         return asyncio.run(svc.get_claim_payment_comparison(None, _filters()))
@@ -562,7 +566,7 @@ class TestChunkingAndSql:
         assert "%(end_utc)s" in query
         assert "c.original_run_id IS NOT NULL" in query
         assert "LEFT JOIN dbo.run_types rt ON rt.id = c.type_id" in query
-        assert "incidents_billing" not in query
+        assert "dbo.incidents_billing" not in query
         assert "FOR SYSTEM_TIME" not in query.upper()
 
     def test_sql_scope_failure_returns_unavailable_empty_result(self):
@@ -1060,3 +1064,93 @@ class TestClaimComparisonRoute:
         assert runs["Unspecified"]["claim_count"] == 1
         assert "billing_target_values" not in data
         assert data["claims_deleted_columns"] == ["id", "timestamp"]
+
+
+# ---------------------------------------------------------------------------
+# Drill-down claim rows
+# ---------------------------------------------------------------------------
+
+class TestClaimRows:
+    def _ai_record(self, claim_id, **extra):
+        return _record(claim_id, {
+            "business_outcome": "released",
+            "business_status_date": "2026-02-10",
+            "invoice_total": 1500.0,
+            "is_billable": True,
+        }, **extra)
+
+    def test_claim_rows_carry_detail_fields(self):
+        scope = [
+            {
+                **_scope_row(1, dept=7, type_id=1, type_name="MVI"),
+                "debug": '{"incident_type": "Motor Vehicle Incident Level 1"}',
+                "amount_invoiced": 1200.0,
+                "invoice_number": "INV-1",
+                "current_status": "Payment Approved",
+                "dept_incidents_billing": 1,
+                "user_id": 42,
+            },
+            _scope_row(2, dept=8, type_id=2, type_name="Structure Fire"),
+        ]
+        versions = (
+            _versions(1,
+                      ("Assigned", "2026-02-11T00:00:00"),
+                      ("Invoiced Insurance", "2026-03-01T00:00:00"),
+                      ("Payment Approved", "2026-03-15T00:00:00"))
+            + _versions(2,
+                      ("Assigned", "2026-02-12T00:00:00"),
+                      ("Unbillable", "2026-03-05T00:00:00"))
+        )
+        records = [self._ai_record(1)]
+        extras = (
+            {1: 1100.0, 2: 0.0},
+            {1: {"insurance_company": "Acme Ins", "adjuster_name": "Jane"}},
+            {2: {"user_id": 77, "marked_at": "2026-03-05T00:00:00"}},
+            True,
+        )
+        resp = _run(scope, versions, records, extras=extras)
+        rows = {c.claim_id: c for c in resp.claims}
+        assert set(rows) == {1, 2}
+
+        c1 = rows[1]
+        assert c1.cohort == "ai_released"
+        assert c1.incident == "Motor Vehicle Incident Level 1"  # debug wins
+        assert c1.department_id == 7 and c1.department_name == "Dept 7"
+        assert c1.department_allows_direct_billing is True
+        assert c1.status == "Payment Approved"
+        assert c1.bucket == "ready_to_be_paid"
+        assert c1.billing_target == "insurance"
+        assert c1.insurance_company == "Acme Ins"
+        assert c1.adjuster_name == "Jane"
+        assert c1.amount_invoiced == 1200.0
+        assert c1.ai_invoice_total == 1500.0
+        assert c1.services_total == 1100.0
+        assert c1.sent_to_insurance_at == "2026-03-01T00:00:00"
+        assert c1.days_submitted_to_insurance == 19.0
+
+        c2 = rows[2]
+        assert c2.cohort == "other" and c2.subtype == "manual"
+        assert c2.incident == "Structure Fire"  # no debug -> run type label
+        assert c2.ever_not_billable is True
+        assert c2.not_billable_by == 77
+        assert c2.not_billable_at == "2026-03-05T00:00:00"
+        assert c2.sent_to_insurance_at is None
+        assert c2.days_submitted_to_insurance is None
+
+    def test_claim_rows_tolerate_missing_optional_fields(self):
+        scope = [_scope_row(3, dept=9)]
+        versions = _versions(3, ("Assigned", "2026-02-12T00:00:00"))
+        resp = _run(scope, versions, [])
+        [row] = resp.claims
+        assert row.claim_id == 3
+        assert row.incident == "Unspecified"
+        assert row.insurance_company is None
+        assert row.services_total is None
+        assert row.department_allows_direct_billing is None
+
+    def test_failed_extras_marks_comparison_partial(self):
+        scope = [_scope_row(3, dept=9)]
+        versions = _versions(3, ("Assigned", "2026-02-12T00:00:00"))
+        resp = _run(scope, versions, [], extras=({}, {}, {}, False))
+        assert resp.data_complete is False
+        assert resp.source_status["recoveryhub_sql"] == "partial"

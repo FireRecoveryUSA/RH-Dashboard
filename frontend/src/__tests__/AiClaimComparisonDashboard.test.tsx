@@ -106,6 +106,58 @@ const COMPARISON = {
     marked_by_processor: 4,
     identified_by_system: 2,
   },
+  claims: [
+    {
+      claim_id: 1,
+      run_number: 'R100',
+      cohort: 'ai_released',
+      subtype: null,
+      department_id: 7,
+      department_name: 'Dept A',
+      department_allows_direct_billing: true,
+      incident: 'Motor Vehicle Incident',
+      status: 'Payment Approved',
+      bucket: 'ready_to_be_paid',
+      billing_target: 'insurance',
+      insurance_company: 'Acme Ins',
+      adjuster_name: 'Jane',
+      invoice_number: 'INV-1',
+      amount_invoiced: 1200,
+      ai_invoice_total: 1500,
+      services_total: 1100,
+      ever_not_billable: false,
+      not_billable_by: null,
+      not_billable_at: null,
+      submitted_at: '2026-02-10T00:00:00',
+      sent_to_insurance_at: '2026-03-01T00:00:00',
+      days_submitted_to_insurance: 19,
+    },
+    {
+      claim_id: 2,
+      run_number: 'R200',
+      cohort: 'other',
+      subtype: 'manual',
+      department_id: 8,
+      department_name: 'Dept B',
+      department_allows_direct_billing: false,
+      incident: 'Motor Vehicle Incident',
+      status: 'Denied',
+      bucket: 'denied',
+      billing_target: 'insurance',
+      insurance_company: 'Acme Ins',
+      adjuster_name: 'Bob',
+      invoice_number: 'INV-2',
+      amount_invoiced: 800,
+      ai_invoice_total: null,
+      services_total: 800,
+      ever_not_billable: true,
+      not_billable_by: 77,
+      not_billable_at: '2026-03-05T00:00:00',
+      submitted_at: '2026-02-12T00:00:00',
+      sent_to_insurance_at: '2026-03-06T00:00:00',
+      days_submitted_to_insurance: 22,
+    },
+  ],
   unmapped_statuses: {},
   resolved_columns: { claims_row_start: 'SysStartTime' },
   source_status: { recoveryhub_sql: 'available', recoveryhub_ai_mongo: 'available' },
@@ -230,5 +282,34 @@ describe('AiClaimComparisonDashboard', () => {
     );
     render(<AiClaimComparisonDashboard />);
     await waitFor(() => expect(screen.getByText(/comparison fetch failed/i)).toBeInTheDocument());
+  });
+
+  test('drills down incident → department → insurer → claim detail', async () => {
+    render(<AiClaimComparisonDashboard />);
+    await waitFor(() => expect(screen.getByText('Claim Detail Drill-Down')).toBeInTheDocument());
+
+    // Level 1: aggregation by incident type
+    expect(screen.getAllByText('Motor Vehicle Incident').length).toBeGreaterThan(0);
+    expect(screen.getByText('All incident types')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: /Motor Vehicle Incident/ }));
+
+    // Level 2: departments within the incident (grouped by dept id)
+    await waitFor(() => expect(screen.getByText('Dept A (#7)')).toBeInTheDocument());
+    expect(screen.getByText('Dept B (#8)')).toBeInTheDocument();
+    fireEvent.click(screen.getByText('Dept A (#7)'));
+
+    // Level 3: insurers within the department
+    await waitFor(() => expect(screen.getAllByText('Acme Ins').length).toBeGreaterThan(0));
+    fireEvent.click(screen.getAllByText('Acme Ins')[0]);
+
+    // Level 4: claim rows for the AI claim under Dept A / Acme Ins
+    await waitFor(() => expect(screen.getByText('R100')).toBeInTheDocument());
+    expect(screen.queryByText('R200')).not.toBeInTheDocument();
+
+    // Expanded row shows per-claim details
+    fireEvent.click(screen.getByLabelText('Toggle claim 1 detail'));
+    await waitFor(() => expect(screen.getByText('INV-1')).toBeInTheDocument());
+    expect(screen.getByText('Jane')).toBeInTheDocument();
+    expect(screen.getByText('19')).toBeInTheDocument();
   });
 });

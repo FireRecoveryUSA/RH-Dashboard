@@ -12,6 +12,7 @@ import {
   aiAnalyticsApi,
   AiClaimComparisonResponse,
   AiClaimComparisonSchemaCheck,
+  ClaimComparisonClaim,
   ClaimComparisonNotBillableCohort,
   ClaimComparisonSegment,
   ClaimComparisonWeek,
@@ -259,6 +260,237 @@ const IncidentOutcomeChart: React.FC<{ segments: ClaimComparisonSegment[] }> = (
       ))}
       <div style={{ fontSize: '11px', color: 'var(--text-muted)' }}>
         Share of finished claims (paid + ready + denied); label shows paid rate and finished count. Other = manual + AI-rejected.
+      </div>
+    </div>
+  );
+};
+
+// ---------------------------------------------------------------------------
+// Claim drill-down — incident → department → insurer → claims
+// ---------------------------------------------------------------------------
+
+const money = (n: number | null | undefined): string =>
+  n == null ? '—' : `$${Math.round(n).toLocaleString()}`;
+
+const invoicedDollars = (c: ClaimComparisonClaim): number =>
+  c.amount_invoiced ?? c.ai_invoice_total ?? c.services_total ?? 0;
+
+const isFinished = (c: ClaimComparisonClaim): boolean =>
+  c.bucket === 'paid' || c.bucket === 'ready_to_be_paid' || c.bucket === 'denied';
+
+const isSuccess = (c: ClaimComparisonClaim): boolean =>
+  c.bucket === 'paid' || c.bucket === 'ready_to_be_paid';
+
+interface DrillAgg {
+  label: string;
+  ai: number;
+  other: number;
+  aiInvoiced: number;
+  otherInvoiced: number;
+  aiRate: number | null;
+  otherRate: number | null;
+}
+
+function aggregateClaims(
+  claims: ClaimComparisonClaim[],
+  key: (c: ClaimComparisonClaim) => string,
+): DrillAgg[] {
+  const groups = new Map<string, ClaimComparisonClaim[]>();
+  for (const c of claims) {
+    const k = key(c);
+    if (!groups.has(k)) groups.set(k, []);
+    groups.get(k)!.push(c);
+  }
+  const rateOf = (list: ClaimComparisonClaim[]) => {
+    const fin = list.filter(isFinished).length;
+    return fin > 0 ? (list.filter(isSuccess).length / fin) * 100 : null;
+  };
+  return [...groups.entries()]
+    .map(([label, list]) => {
+      const ai = list.filter((c) => c.cohort === 'ai_released');
+      const other = list.filter((c) => c.cohort === 'other');
+      return {
+        label,
+        ai: ai.length,
+        other: other.length,
+        aiInvoiced: ai.reduce((s, c) => s + invoicedDollars(c), 0),
+        otherInvoiced: other.reduce((s, c) => s + invoicedDollars(c), 0),
+        aiRate: rateOf(ai),
+        otherRate: rateOf(other),
+      };
+    })
+    .sort((a, b) => b.ai + b.other - (a.ai + a.other));
+}
+
+interface DrillPath {
+  incident?: string;
+  department?: string;
+  insurer?: string;
+}
+
+const departmentKey = (c: ClaimComparisonClaim): string =>
+  c.department_id != null
+    ? `${c.department_name ?? 'Unknown'} (#${c.department_id})`
+    : c.department_name ?? 'Unknown';
+
+const ClaimDrillDown: React.FC<{ claims: ClaimComparisonClaim[] }> = ({ claims }) => {
+  const [path, setPath] = useState<DrillPath>({});
+  const [expanded, setExpanded] = useState<number | null>(null);
+
+  const visible = useMemo(() => claims.filter((c) =>
+    (path.incident === undefined || c.incident === path.incident)
+    && (path.department === undefined || departmentKey(c) === path.department)
+    && (path.insurer === undefined || (c.insurance_company ?? 'Unknown') === path.insurer)
+  ), [claims, path]);
+
+  const atClaims = path.insurer !== undefined;
+
+  const agg = useMemo(() => {
+    if (path.incident === undefined) {
+      return aggregateClaims(visible, (c) => c.incident);
+    }
+    if (path.department === undefined) {
+      return aggregateClaims(visible, departmentKey);
+    }
+    return aggregateClaims(visible, (c) => c.insurance_company ?? 'Unknown');
+  }, [visible, path]);
+
+  const linkStyle: React.CSSProperties = {
+    color: 'var(--accent, #3b82f6)', cursor: 'pointer', border: 'none',
+    background: 'none', padding: 0, fontSize: 'inherit', textAlign: 'left',
+  };
+
+  const crumbs: Array<{ label: string; clear: () => void }> = [
+    { label: 'All incident types', clear: () => setPath({}) },
+    ...(path.incident !== undefined ? [{ label: path.incident, clear: () => setPath({ incident: path.incident }) }] : []),
+    ...(path.department !== undefined ? [{ label: path.department, clear: () => setPath({ incident: path.incident, department: path.department }) }] : []),
+    ...(path.insurer !== undefined ? [{ label: path.insurer, clear: () => setPath(path) }] : []),
+  ];
+
+  return (
+    <div>
+      <div style={{ fontSize: '12px', marginBottom: '10px', color: 'var(--text-muted)' }}>
+        {crumbs.map((crumb, i) => (
+          <span key={i}>
+            {i > 0 && ' / '}
+            <button style={linkStyle} onClick={crumb.clear}>{crumb.label}</button>
+          </span>
+        ))}
+      </div>
+      {!atClaims ? (
+        <div style={{ overflowX: 'auto' }}>
+          <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+            <thead>
+              <tr>
+                <th style={thStyle}>
+                  {path.incident === undefined ? 'Incident type'
+                    : path.department === undefined ? 'Department' : 'Insurance company'}
+                </th>
+                <th style={thStyle}>AI claims</th>
+                <th style={thStyle}>AI invoiced</th>
+                <th style={thStyle}>AI paid rate</th>
+                <th style={thStyle}>Other claims</th>
+                <th style={thStyle}>Other invoiced</th>
+                <th style={thStyle}>Other paid rate</th>
+              </tr>
+            </thead>
+            <tbody>
+              {agg.map((row) => (
+                <tr key={row.label}>
+                  <td style={tdStyle}>
+                    <button
+                      style={linkStyle}
+                      onClick={() => {
+                        if (path.incident === undefined) setPath({ incident: row.label });
+                        else if (path.department === undefined) setPath({ ...path, department: row.label });
+                        else setPath({ ...path, insurer: row.label });
+                      }}
+                    >
+                      {row.label} <ChevronRight size={11} style={{ verticalAlign: '-1px' }} />
+                    </button>
+                  </td>
+                  <td style={tdStyle}>{row.ai.toLocaleString()}</td>
+                  <td style={tdStyle}>{money(row.aiInvoiced)}</td>
+                  <td style={tdStyle}>{row.aiRate == null ? '—' : formatPercent(row.aiRate)}</td>
+                  <td style={tdStyle}>{row.other.toLocaleString()}</td>
+                  <td style={tdStyle}>{money(row.otherInvoiced)}</td>
+                  <td style={tdStyle}>{row.otherRate == null ? '—' : formatPercent(row.otherRate)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      ) : (
+        <div style={{ overflowX: 'auto' }}>
+          <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+            <thead>
+              <tr>
+                <th style={thStyle}></th>
+                <th style={thStyle}>Claim</th>
+                <th style={thStyle}>Cohort</th>
+                <th style={thStyle}>Status</th>
+                <th style={thStyle}>Billed</th>
+                <th style={thStyle}>Target</th>
+                <th style={thStyle}>AI total</th>
+                <th style={thStyle}>Services total</th>
+                <th style={thStyle}>Not billable by</th>
+                <th style={thStyle}>Submit → insurance (d)</th>
+              </tr>
+            </thead>
+            <tbody>
+              {visible.map((c) => (
+                <React.Fragment key={c.claim_id}>
+                  <tr>
+                    <td style={tdStyle}>
+                      <button
+                        style={linkStyle}
+                        onClick={() => setExpanded(expanded === c.claim_id ? null : c.claim_id)}
+                        aria-label={`Toggle claim ${c.claim_id} detail`}
+                      >
+                        {expanded === c.claim_id ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
+                      </button>
+                    </td>
+                    <td style={tdStyle}>{c.run_number ?? c.claim_id}</td>
+                    <td style={{ ...tdStyle, color: c.cohort === 'ai_released' ? '#22c55e' : '#ef4444' }}>
+                      {c.cohort === 'ai_released' ? 'AI' : (c.subtype === 'ai_rejected' ? 'AI-rejected' : 'Manual')}
+                    </td>
+                    <td style={tdStyle}>{c.status ?? '—'}</td>
+                    <td style={tdStyle}>{money(c.amount_invoiced)}</td>
+                    <td style={tdStyle}>{c.billing_target}</td>
+                    <td style={tdStyle}>{money(c.ai_invoice_total)}</td>
+                    <td style={tdStyle}>{money(c.services_total)}</td>
+                    <td style={tdStyle}>
+                      {c.ever_not_billable ? (c.not_billable_by ?? 'yes') : '—'}
+                    </td>
+                    <td style={tdStyle}>{c.days_submitted_to_insurance ?? '—'}</td>
+                  </tr>
+                  {expanded === c.claim_id && (
+                    <tr>
+                      <td colSpan={10} style={{ ...tdStyle, background: 'var(--bg-secondary, rgba(128,128,128,0.08))' }}>
+                        <div style={{ display: 'flex', flexWrap: 'wrap', gap: '16px', fontSize: '12px' }}>
+                          <span><strong>Invoice #:</strong> {c.invoice_number ?? '—'}</span>
+                          <span><strong>Adjuster:</strong> {c.adjuster_name ?? '—'}</span>
+                          <span><strong>Insurer:</strong> {c.insurance_company ?? '—'}</span>
+                          <span><strong>Direct billing allowed:</strong> {c.department_allows_direct_billing == null ? '—' : c.department_allows_direct_billing ? 'yes' : 'no'}</span>
+                          <span><strong>Submitted:</strong> {c.submitted_at?.slice(0, 10) ?? '—'}</span>
+                          <span><strong>Sent to insurance:</strong> {c.sent_to_insurance_at?.slice(0, 10) ?? '—'}</span>
+                          <span><strong>Marked not-billable:</strong> {c.not_billable_at?.slice(0, 10) ?? '—'}</span>
+                          {c.ai_invoice_total != null && c.services_total != null && (
+                            <span><strong>AI vs services diff:</strong> {money(c.ai_invoice_total - c.services_total)}</span>
+                          )}
+                        </div>
+                      </td>
+                    </tr>
+                  )}
+                </React.Fragment>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+      <div style={{ marginTop: '10px', fontSize: '11px', color: 'var(--text-muted)' }}>
+        Invoiced = Claims.amount_invoiced (AI fallback: AI invoice total). Paid rate =
+        (paid + ready) / finished claims. Drill: incident type → department → insurer → claims.
       </div>
     </div>
   );
@@ -608,6 +840,11 @@ export const AiClaimComparisonDashboard: React.FC = () => {
         chart={<IncidentOutcomeChart segments={data.by_incident_type} />}
       />
       <SegmentTable title="By Billing Target" labelHeader="Billing target" segments={data.by_billing_target} />
+      {(data.claims?.length ?? 0) > 0 && (
+        <SectionCard title="Claim Detail Drill-Down">
+          <ClaimDrillDown claims={data.claims} />
+        </SectionCard>
+      )}
       <NotBillableSection data={data} />
 
       <SectionCard title="Data Quality & Schema Check">
