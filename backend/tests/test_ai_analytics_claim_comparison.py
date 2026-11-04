@@ -1173,6 +1173,12 @@ class TestClaimComparisonRoute:
 # ---------------------------------------------------------------------------
 
 class TestClaimRows:
+    @pytest.fixture(autouse=True)
+    def clear_last_user_names_cache(self):
+        svc._last_user_names.clear()
+        yield
+        svc._last_user_names.clear()
+
     def _ai_record(self, claim_id, **extra):
         return _record(claim_id, {
             "business_outcome": "released",
@@ -1270,6 +1276,27 @@ class TestClaimRows:
         assert claim.not_billable_by == 77
         assert claim.not_billable_by_name is None
         assert claim.not_billable_at == "2026-03-05T00:00:00"
+
+    def test_user_name_lookup_failure_uses_last_known_names(self):
+        markers = {
+            3: {
+                "user_id": 77,
+                "marked_at": "2026-03-05T00:00:00",
+                "prior_status": "Assigned",
+            }
+        }
+        with patch(f"{SQL}.get_claim_services_totals", return_value={}), \
+             patch(f"{SQL}.get_claim_adjusters", return_value={}), \
+             patch(f"{SQL}.get_not_billable_markers", return_value=markers), \
+             patch(
+                 f"{SQL}.get_user_names",
+                 side_effect=[{77: "Pat Smith"}, RuntimeError("lookup failed")],
+             ) as lookup:
+            first = svc._fetch_claim_extras([3], ROW_START)
+            second = svc._fetch_claim_extras([3], ROW_START)
+        assert first == ({}, {}, markers, {77: "Pat Smith"}, True)
+        assert second == ({}, {}, markers, {77: "Pat Smith"}, True)
+        assert lookup.call_count == 2
 
     def test_claim_rows_tolerate_missing_optional_fields(self):
         scope = [_scope_row(3, dept=9)]

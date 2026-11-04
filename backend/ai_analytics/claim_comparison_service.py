@@ -76,6 +76,7 @@ from .claim_status_config import (
 from .cache import cached, prime_cache, touch_cache
 
 logger = logging.getLogger(__name__)
+_last_user_names: Dict[int, str] = {}
 
 HISTORY_CHUNK_SIZE = 2000
 
@@ -329,15 +330,20 @@ def _fetch_claim_extras(
     except Exception as e:
         ok = False
         logger.error(f"not-billable markers query failed: {e}")
+    user_ids = sorted({
+        int(marker["user_id"])
+        for marker in markers.values()
+        if marker.get("user_id") is not None
+    })
     try:
-        user_ids = sorted({
-            int(marker["user_id"])
-            for marker in markers.values()
-            if marker.get("user_id") is not None
-        })
         user_names = sql_repo.get_user_names(user_ids)
+        _last_user_names.update(user_names)
     except Exception as e:
-        user_names = {}
+        user_names = {
+            user_id: _last_user_names[user_id]
+            for user_id in user_ids
+            if user_id in _last_user_names
+        }
         logger.warning(f"not-billable user-name lookup failed: {e}")
     return totals, adjusters, markers, user_names, ok
 
