@@ -293,10 +293,10 @@ describe('AiClaimComparisonDashboard', () => {
     expect(screen.getByText('All incident types')).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: /Motor Vehicle Incident/ }));
 
-    // Level 2: departments within the incident
-    await waitFor(() => expect(screen.getByText('Dept A')).toBeInTheDocument());
-    expect(screen.getByText('Dept B')).toBeInTheDocument();
-    fireEvent.click(screen.getByText('Dept A'));
+    // Level 2: departments within the incident (grouped by dept id)
+    await waitFor(() => expect(screen.getByText('Dept A (#7)')).toBeInTheDocument());
+    expect(screen.getByText('Dept B (#8)')).toBeInTheDocument();
+    fireEvent.click(screen.getByText('Dept A (#7)'));
 
     // Level 3: insurers within the department
     await waitFor(() => expect(screen.getAllByText('Acme Ins').length).toBeGreaterThan(0));

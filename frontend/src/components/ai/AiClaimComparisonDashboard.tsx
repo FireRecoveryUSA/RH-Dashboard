@@ -303,7 +303,7 @@ function aggregateClaims(
   }
   const rateOf = (list: ClaimComparisonClaim[]) => {
     const fin = list.filter(isFinished).length;
-    return fin > 0 ? list.filter(isSuccess).length / fin : null;
+    return fin > 0 ? (list.filter(isSuccess).length / fin) * 100 : null;
   };
   return [...groups.entries()]
     .map(([label, list]) => {
@@ -328,13 +328,18 @@ interface DrillPath {
   insurer?: string;
 }
 
+const departmentKey = (c: ClaimComparisonClaim): string =>
+  c.department_id != null
+    ? `${c.department_name ?? 'Unknown'} (#${c.department_id})`
+    : c.department_name ?? 'Unknown';
+
 const ClaimDrillDown: React.FC<{ claims: ClaimComparisonClaim[] }> = ({ claims }) => {
   const [path, setPath] = useState<DrillPath>({});
   const [expanded, setExpanded] = useState<number | null>(null);
 
   const visible = useMemo(() => claims.filter((c) =>
     (path.incident === undefined || c.incident === path.incident)
-    && (path.department === undefined || (c.department_name ?? 'Unknown') === path.department)
+    && (path.department === undefined || departmentKey(c) === path.department)
     && (path.insurer === undefined || (c.insurance_company ?? 'Unknown') === path.insurer)
   ), [claims, path]);
 
@@ -345,7 +350,7 @@ const ClaimDrillDown: React.FC<{ claims: ClaimComparisonClaim[] }> = ({ claims }
       return aggregateClaims(visible, (c) => c.incident);
     }
     if (path.department === undefined) {
-      return aggregateClaims(visible, (c) => c.department_name ?? 'Unknown');
+      return aggregateClaims(visible, departmentKey);
     }
     return aggregateClaims(visible, (c) => c.insurance_company ?? 'Unknown');
   }, [visible, path]);

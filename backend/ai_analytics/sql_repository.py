@@ -9,6 +9,7 @@ RecoveryHub Azure SQL.
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from target_db import target_db, TargetDatabaseError
@@ -571,15 +572,15 @@ _CLAIM_SCOPE_WHERE = f"""
 _row_start_column_cache: Dict[str, str] = {}
 
 
-def get_table_column_names(table_name: str) -> List[str]:
-    """Column names of a dbo table, in ordinal order."""
+def get_table_column_names(table_name: str, schema: str = "dbo") -> List[str]:
+    """Column names of a table in the given schema, in ordinal order."""
     query = """
     SELECT c.COLUMN_NAME
     FROM INFORMATION_SCHEMA.COLUMNS c
-    WHERE c.TABLE_SCHEMA = 'dbo' AND c.TABLE_NAME = %(table_name)s
+    WHERE c.TABLE_SCHEMA = %(schema)s AND c.TABLE_NAME = %(table_name)s
     ORDER BY c.ORDINAL_POSITION
     """
-    rows = _execute_parameterized(query, {"table_name": table_name})
+    rows = _execute_parameterized(query, {"table_name": table_name, "schema": schema})
     return [str(r["COLUMN_NAME"]) for r in rows if r.get("COLUMN_NAME")]
 
 
@@ -609,11 +610,12 @@ def _quote_identifier(name: str) -> str:
 _table_columns_cache: Dict[str, List[str]] = {}
 
 
-def _cached_table_columns(table_name: str) -> List[str]:
+def _cached_table_columns(table_name: str, schema: str = "dbo") -> List[str]:
     """``get_table_column_names`` with per-process caching (schema never changes mid-run)."""
-    if table_name not in _table_columns_cache:
-        _table_columns_cache[table_name] = get_table_column_names(table_name)
-    return _table_columns_cache[table_name]
+    cache_key = f"{schema}.{table_name}"
+    if cache_key not in _table_columns_cache:
+        _table_columns_cache[cache_key] = get_table_column_names(table_name, schema)
+    return _table_columns_cache[cache_key]
 
 
 def _pick_column(columns: List[str], *candidates: str) -> Optional[str]:
@@ -842,36 +844,59 @@ def get_claim_services_totals(claim_ids: List[int]) -> Dict[int, float]:
     return totals
 
 
-def get_not_billable_markers(claim_ids: List[int], row_start_column: str) -> Dict[int, Dict[str, Any]]:
+def get_not_billable_markers(
+    claim_ids: List[int],
+    row_start_column: str,
+    as_of: Optional[datetime] = None,
+) -> Dict[int, Dict[str, Any]]:
     """First 'not billable' version per claim: when it was marked and by whom (user_id).
 
-    ``user_id`` is the processor who changed the status. When claimsHistory
-    lacks the column the marker still carries the timestamp.
+    ``user_id`` is the processor who changed the status. When the column is
+    absent the marker still carries the timestamp. Both history versions and
+    the live Claims row are considered, and ``as_of`` caps markers at the
+    comparison window's end so future markers don't leak into past periods.
     """
-    history_cols = _cached_table_columns("claimsHistory")
-    user_id_col = _pick_column(history_cols or [], "user_id")
+    history_cols = _cached_table_columns("claimsHistory", schema="AuditData")
+    history_user_col = _pick_column(history_cols or [], "user_id")
+    claims_cols = _cached_table_columns("Claims")
+    claims_user_col = _pick_column(claims_cols or [], "user_id")
     row_start = _quote_identifier(row_start_column)
-    user_select = f"h.{_quote_identifier(user_id_col)}" if user_id_col else "CAST(NULL AS int)"
+    history_user = f"h.{_quote_identifier(history_user_col)}" if history_user_col else "CAST(NULL AS int)"
+    claims_user = f"c.{_quote_identifier(claims_user_col)}" if claims_user_col else "CAST(NULL AS int)"
+    as_of_clause = "AND h." + row_start + " < %(as_of)s" if as_of is not None else ""
+    current_as_of_clause = "AND c." + row_start + " < %(as_of)s" if as_of is not None else ""
+    params: Dict[str, Any] = {}
+    if as_of is not None:
+        params["as_of"] = as_of
     markers: Dict[int, Dict[str, Any]] = {}
     for chunk in _chunked_ids(claim_ids):
         csv = ",".join(str(int(cid)) for cid in chunk)
         rows = _execute_parameterized(
             f"""
-            SELECT h.id, {user_select} AS user_id, h.{row_start} AS marked_at
-            FROM AuditData.claimsHistory h
-            WHERE LOWER(h.status) IN ({_NOT_BILLABLE_STATUS_SQL})
-              AND h.id IN (
-                  SELECT CAST(value AS int) FROM STRING_SPLIT(CAST(%(ids)s AS nvarchar(max)), ',')
-              )
-            ORDER BY h.id, h.{row_start}
+            SELECT m.id, m.user_id, m.marked_at
+            FROM (
+                SELECT h.id, {history_user} AS user_id, h.{row_start} AS marked_at
+                FROM AuditData.claimsHistory h
+                WHERE LOWER(h.status) IN ({_NOT_BILLABLE_STATUS_SQL})
+                  {as_of_clause}
+                UNION ALL
+                SELECT c.id, {claims_user} AS user_id, c.{row_start} AS marked_at
+                FROM dbo.Claims c
+                WHERE LOWER(c.status) IN ({_NOT_BILLABLE_STATUS_SQL})
+                  {current_as_of_clause}
+            ) m
+            WHERE m.id IN (
+                SELECT CAST(value AS int) FROM STRING_SPLIT(CAST(%(ids)s AS nvarchar(max)), ',')
+            )
+            ORDER BY m.id, m.marked_at
             """,
-            {"ids": csv},
+            {**params, "ids": csv},
         )
         for row in rows:
             if row.get("id") is None:
                 continue
             cid = int(row["id"])
-            if cid not in markers:  # rows arrive ordered by row_start — first wins
+            if cid not in markers:  # rows arrive ordered by marked_at — first wins
                 markers[cid] = {
                     "user_id": row.get("user_id"),
                     "marked_at": row.get("marked_at"),

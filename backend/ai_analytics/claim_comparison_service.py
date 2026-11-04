@@ -143,11 +143,11 @@ def _cohort_for(record: Optional[Dict[str, Any]]) -> Tuple[str, Optional[str]]:
     return COHORT_AI_PENDING, None
 
 
-def _effective_state(
-    versions: Iterable[Tuple[str, str, datetime, bool]],
+def _effective_version(
+    versions: Iterable[Tuple[str, str, datetime, bool, datetime]],
     as_of: Optional[datetime] = None,
-) -> Optional[Tuple[str, datetime]]:
-    """Latest non-archive (bucket, row_start) from (status, bucket, row_start, is_current).
+) -> Optional[Tuple[str, str, datetime, bool, datetime]]:
+    """Latest non-archive version under the same rules everywhere it is used.
 
     ``as_of`` caps the state at the end of the comparison window: versions
     recorded after it are ignored, so a past window never includes future
@@ -157,9 +157,10 @@ def _effective_state(
     it is the authoritative current state. Without this, the choice depends on
     SQL row order and changes between requests.
     """
-    best: Optional[Tuple[str, datetime]] = None
+    best: Optional[Tuple[str, str, datetime, bool, datetime]] = None
     best_key: Optional[Tuple[datetime, bool]] = None
-    for _status, bucket, row_start, is_current, _first_start in versions:
+    for version in versions:
+        _status, bucket, row_start, is_current, _first_start = version
         if bucket == BUCKET_ARCHIVE:
             continue
         if as_of is not None and row_start >= as_of:
@@ -167,8 +168,28 @@ def _effective_state(
         key = (row_start, is_current)
         if best_key is None or key > best_key:
             best_key = key
-            best = (bucket, row_start)
+            best = version
     return best
+
+
+def _effective_state(
+    versions: Iterable[Tuple[str, str, datetime, bool]],
+    as_of: Optional[datetime] = None,
+) -> Optional[Tuple[str, datetime]]:
+    """Latest non-archive (bucket, row_start) — see ``_effective_version``."""
+    version = _effective_version(versions, as_of)
+    if version is None:
+        return None
+    return (version[1], version[2])
+
+
+def _effective_status_name(
+    versions: Iterable[Tuple[str, str, datetime, bool, datetime]],
+    as_of: Optional[datetime],
+) -> Optional[str]:
+    """Raw status of the effective version — see ``_effective_version``."""
+    version = _effective_version(versions, as_of)
+    return version[0] if version else None
 
 
 def _fetch_status_versions(
@@ -275,41 +296,39 @@ def _incident_from_debug(debug: Any) -> Optional[str]:
 def _fetch_claim_extras(
     claim_ids: List[int],
     row_start_column: str,
+    as_of: Optional[datetime] = None,
 ) -> Tuple[Dict[int, float], Dict[int, Dict[str, Optional[str]]], Dict[int, Dict[str, Any]]]:
     """Per-claim extras for the drill-down rows: line-item totals, adjusters,
-    and who/when marked not-billable. Sync; called via asyncio.to_thread."""
-    return (
-        sql_repo.get_claim_services_totals(claim_ids),
-        sql_repo.get_claim_adjusters(claim_ids),
-        sql_repo.get_not_billable_markers(claim_ids, row_start_column),
-    )
-
-
-def _effective_status_name(
-    versions: Iterable[Tuple[str, str, datetime, bool, datetime]],
-    as_of: Optional[datetime],
-) -> Optional[str]:
-    """Raw status of the effective version (same selection rule as _effective_state)."""
-    best: Optional[str] = None
-    best_key: Optional[Tuple[datetime, bool]] = None
-    for status, bucket, last_start, is_current, _fs in versions:
-        if bucket == BUCKET_ARCHIVE:
-            continue
-        if as_of is not None and last_start >= as_of:
-            continue
-        key = (last_start, is_current)
-        if best_key is None or key > best_key:
-            best_key = key
-            best = status
-    return best
+    and who/when marked not-billable. Sync; called via asyncio.to_thread.
+    Each query degrades independently so one failure keeps the others' data."""
+    totals: Dict[int, float] = {}
+    adjusters: Dict[int, Dict[str, Optional[str]]] = {}
+    markers: Dict[int, Dict[str, Any]] = {}
+    try:
+        totals = sql_repo.get_claim_services_totals(claim_ids)
+    except Exception as e:
+        logger.error(f"claim_services totals query failed: {e}")
+    try:
+        adjusters = sql_repo.get_claim_adjusters(claim_ids)
+    except Exception as e:
+        logger.error(f"adjusters query failed: {e}")
+    try:
+        markers = sql_repo.get_not_billable_markers(claim_ids, row_start_column, as_of)
+    except Exception as e:
+        logger.error(f"not-billable markers query failed: {e}")
+    return totals, adjusters, markers
 
 
 def _first_insurance_start(
     versions: Iterable[Tuple[str, str, datetime, bool, datetime]],
+    as_of: Optional[datetime] = None,
 ) -> Optional[datetime]:
+    """First insurance-status start within the window; ``as_of`` keeps a past
+    period from reporting send dates that happened after it."""
     starts = [
         fs for status, _b, _ls, _cur, fs in versions
         if status and status.strip().lower() in INSURANCE_BILLING_STATUSES
+        and (as_of is None or fs < as_of)
     ]
     return min(starts) if starts else None
 
@@ -634,7 +653,7 @@ async def _compute_claim_payment_comparison(
     nb_markers: Dict[int, Dict[str, Any]] = {}
     try:
         services_totals, adjusters, nb_markers = await asyncio.to_thread(
-            _fetch_claim_extras, tracked_ids, row_start_column,
+            _fetch_claim_extras, tracked_ids, row_start_column, as_of,
         )
     except Exception as e:
         logger.error(f"Claim comparison claim-extras query failed: {e}")
@@ -679,7 +698,7 @@ async def _compute_claim_payment_comparison(
         adjuster = adjusters.get(claim_id, {})
         marker = nb_markers.get(claim_id, {})
         submitted_dt = _parse_ts(row["date_of_submitted"]) if row.get("date_of_submitted") else None
-        sent_insurance = _first_insurance_start(claim_versions)
+        sent_insurance = _first_insurance_start(claim_versions, as_of)
         days_to_insurance = (
             round((sent_insurance - submitted_dt).total_seconds() / 86400, 1)
             if sent_insurance and submitted_dt else None
