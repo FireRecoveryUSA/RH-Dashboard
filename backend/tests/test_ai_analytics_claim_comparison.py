@@ -614,6 +614,32 @@ class TestChunkingAndSql:
             result = sql_repo.get_user_names([77])
         assert result == {77: "Patricia Smith"}
 
+    def test_user_names_skip_tables_without_name_columns(self):
+        columns_by_table = {
+            "Users": ["id", "status"],
+            "AspNetUsers": ["Id", "display_name"],
+        }
+        rows = [{
+            "user_id": 77,
+            "first_name": None,
+            "last_name": None,
+            "full_name": "Pat Smith",
+        }]
+        with patch(
+            f"{SQL}._cached_table_columns",
+            side_effect=lambda table: columns_by_table.get(table, []),
+        ) as columns, patch(
+            f"{SQL}._execute_parameterized", return_value=rows,
+        ) as execute:
+            result = sql_repo.get_user_names([77])
+        query, _ = execute.call_args.args
+        assert result == {77: "Pat Smith"}
+        assert "FROM dbo.[AspNetUsers] u" in query
+        assert "u.[display_name] AS full_name" in query
+        assert [call.args[0] for call in columns.call_args_list] == [
+            "Users", "AspNetUsers",
+        ]
+
     def test_user_names_without_resolvable_table_or_empty_ids_do_not_query(self):
         with patch(f"{SQL}._cached_table_columns", return_value=[]) as columns, \
              patch(f"{SQL}._execute_parameterized") as execute:
@@ -1216,7 +1242,7 @@ class TestClaimRows:
         assert c2.sent_to_insurance_at is None
         assert c2.days_submitted_to_insurance is None
 
-    def test_user_name_lookup_failure_preserves_markers_and_marks_partial(self):
+    def test_user_name_lookup_failure_is_nonfatal_and_preserves_markers(self):
         markers = {
             3: {
                 "user_id": 77,
@@ -1230,7 +1256,7 @@ class TestClaimRows:
              patch(f"{SQL}.get_user_names", side_effect=RuntimeError("lookup failed")) as lookup:
             extras = svc._fetch_claim_extras([3], ROW_START)
         lookup.assert_called_once_with([77])
-        assert extras == ({}, {}, markers, {}, False)
+        assert extras == ({}, {}, markers, {}, True)
 
         resp = _run(
             [_scope_row(3, dept=9)],
@@ -1239,8 +1265,8 @@ class TestClaimRows:
             extras=extras,
         )
         [claim] = resp.claims
-        assert resp.data_complete is False
-        assert resp.source_status["recoveryhub_sql"] == "partial"
+        assert resp.data_complete is True
+        assert resp.source_status["recoveryhub_sql"] == "available"
         assert claim.not_billable_by == 77
         assert claim.not_billable_by_name is None
         assert claim.not_billable_at == "2026-03-05T00:00:00"

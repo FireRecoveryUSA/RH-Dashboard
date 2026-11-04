@@ -988,30 +988,38 @@ def get_user_names(user_ids: List[int]) -> Dict[int, str]:
         return {}
 
     table_name: Optional[str] = None
-    table_cols: List[str] = []
     id_col: Optional[str] = None
+    first_col: Optional[str] = None
+    last_col: Optional[str] = None
+    full_col: Optional[str] = None
     for candidate in ("Users", "AspNetUsers", "User", "rh_users"):
         columns = _cached_table_columns(candidate)
         candidate_id = _pick_column(columns, "id", "user_id", "UserId")
-        if columns and candidate_id:
-            table_name = candidate
-            table_cols = columns
-            id_col = candidate_id
-            break
+        if not columns or not candidate_id:
+            continue
+        candidate_first = _pick_column(
+            columns, "first_name", "firstname", "FirstName", "fname",
+        )
+        candidate_last = _pick_column(
+            columns, "last_name", "lastname", "LastName", "lname",
+        )
+        candidate_full = _pick_column(
+            columns,
+            "full_name", "fullname", "display_name", "DisplayName",
+            "name", "username", "user_name", "UserName", "email", "Email",
+        )
+        if candidate_first is None and candidate_last is None and candidate_full is None:
+            continue
+        table_name = candidate
+        id_col = candidate_id
+        first_col = candidate_first
+        last_col = candidate_last
+        full_col = candidate_full
+        break
     if table_name is None or id_col is None:
         return {}
 
     logger.info("Resolving claim-comparison user names from dbo.%s", table_name)
-    first_col = _pick_column(table_cols, "first_name", "firstname", "FirstName", "fname")
-    last_col = _pick_column(table_cols, "last_name", "lastname", "LastName", "lname")
-    full_col = _pick_column(
-        table_cols,
-        "full_name", "fullname", "display_name", "DisplayName",
-        "name", "username", "user_name", "UserName", "email", "Email",
-    )
-    if first_col is None and last_col is None and full_col is None:
-        return {}
-
     first_select = (
         f"u.{_quote_identifier(first_col)}" if first_col
         else "CAST(NULL AS nvarchar)"

@@ -337,7 +337,6 @@ def _fetch_claim_extras(
         })
         user_names = sql_repo.get_user_names(user_ids)
     except Exception as e:
-        ok = False
         user_names = {}
         logger.warning(f"not-billable user-name lookup failed: {e}")
     return totals, adjusters, markers, user_names, ok
