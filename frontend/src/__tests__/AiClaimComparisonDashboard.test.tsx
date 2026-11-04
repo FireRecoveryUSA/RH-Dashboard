@@ -340,4 +340,14 @@ describe('AiClaimComparisonDashboard', () => {
     expect(review.getByText('not allowed')).toBeInTheDocument();
     expect(review.getByText('$800')).toBeInTheDocument();
   });
+
+  test('shows the not-billable review empty state when no claims were marked', async () => {
+    (aiAnalyticsApi.getClaimComparison as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+      ...COMPARISON,
+      claims: COMPARISON.claims.map((claim) => ({ ...claim, ever_not_billable: false })),
+    });
+    render(<AiClaimComparisonDashboard />);
+    expect(await screen.findByText('Not-Billable Claims Review')).toBeInTheDocument();
+    expect(screen.getByText('No claims in this period were marked not-billable.')).toBeInTheDocument();
+  });
 });

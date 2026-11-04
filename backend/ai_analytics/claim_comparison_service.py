@@ -258,27 +258,6 @@ def _process_entry_local_date(
     return (earliest + local_offset).date()
 
 
-def _status_before(
-    claim_versions: List[Tuple[str, str, datetime, bool, datetime]],
-    moment: Optional[datetime],
-) -> Optional[str]:
-    """Status the claim was in right before ``moment``.
-
-    Versions are grouped per status (first/last start), so a status that
-    recurs after ``moment`` still counts via its first start.
-    """
-    if moment is None:
-        return None
-    best: Optional[Tuple[datetime, str]] = None
-    for status, _b, last_start, _cur, first_start in claim_versions:
-        start = last_start if last_start < moment else (
-            first_start if first_start < moment else None
-        )
-        if start is not None and (best is None or start > best[0]):
-            best = (start, status)
-    return best[1] if best else None
-
-
 _INCIDENT_KEY_RE = re.compile(
     r'"?(?:incident[_ ]?type|incidentType|neris[_ ]?(?:incident[_ ]?)?type)"?\s*[:=]\s*"?([^",}\n]+)',
     re.IGNORECASE,
@@ -739,7 +718,6 @@ async def _compute_claim_payment_comparison(
         except (TypeError, ValueError):
             dept_allows_direct = None
         marked_at_dt = _parse_ts(marker["marked_at"]) if marker.get("marked_at") else None
-        prior_status = _status_before(claim_versions, marked_at_dt)
         claim_rows.append(ClaimComparisonClaim(
             claim_id=claim_id,
             run_number=row.get("run_number"),
@@ -761,7 +739,7 @@ async def _compute_claim_payment_comparison(
             ever_not_billable=ever_nb,
             not_billable_by=marker.get("user_id"),
             not_billable_at=marked_at_dt.isoformat() if marked_at_dt else None,
-            status_when_not_billable=prior_status,
+            status_when_not_billable=marker.get("prior_status"),
             submitted_at=submitted_dt.isoformat() if submitted_dt else None,
             sent_to_insurance_at=sent_insurance.isoformat() if sent_insurance else None,
             days_submitted_to_insurance=days_to_insurance,

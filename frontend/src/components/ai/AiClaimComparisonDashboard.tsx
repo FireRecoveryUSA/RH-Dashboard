@@ -344,6 +344,9 @@ const departmentKey = (c: ClaimComparisonClaim): string =>
     ? `${c.department_name ?? 'Unknown'} (#${c.department_id})`
     : c.department_name ?? 'Unknown';
 
+const cohortLabel = (c: ClaimComparisonClaim): string =>
+  c.cohort === 'ai_released' ? 'AI' : (c.subtype === 'ai_rejected' ? 'AI-rejected' : 'Manual');
+
 const processorKey = (c: ClaimComparisonClaim): string =>
   c.not_billable_by != null ? `User ${c.not_billable_by}` : 'No not-billable marker';
 
@@ -352,7 +355,13 @@ const collectedCell = (total: number, count: number): string =>
 
 const NotBillableClaimsSection: React.FC<{ claims: ClaimComparisonClaim[] }> = ({ claims }) => {
   const marked = claims.filter((c) => c.ever_not_billable);
-  if (marked.length === 0) return null;
+  if (marked.length === 0) {
+    return (
+      <div style={{ fontSize: '12px', color: 'var(--text-muted)' }}>
+        No claims in this period were marked not-billable.
+      </div>
+    );
+  }
   return (
     <div style={{ overflowX: 'auto' }}>
       <table style={{ width: '100%', borderCollapse: 'collapse' }}>
@@ -374,7 +383,7 @@ const NotBillableClaimsSection: React.FC<{ claims: ClaimComparisonClaim[] }> = (
             <tr key={c.claim_id}>
               <td style={tdStyle}>{c.run_number ?? c.claim_id}</td>
               <td style={{ ...tdStyle, color: c.cohort === 'ai_released' ? '#22c55e' : '#ef4444' }}>
-                {c.cohort === 'ai_released' ? 'AI' : (c.subtype === 'ai_rejected' ? 'AI-rejected' : 'Manual')}
+                {cohortLabel(c)}
               </td>
               <td style={tdStyle}>{departmentKey(c)}</td>
               <td style={tdStyle}>
@@ -532,7 +541,7 @@ const ClaimDrillDown: React.FC<{ claims: ClaimComparisonClaim[] }> = ({ claims }
                     </td>
                     <td style={tdStyle}>{c.run_number ?? c.claim_id}</td>
                     <td style={{ ...tdStyle, color: c.cohort === 'ai_released' ? '#22c55e' : '#ef4444' }}>
-                      {c.cohort === 'ai_released' ? 'AI' : (c.subtype === 'ai_rejected' ? 'AI-rejected' : 'Manual')}
+                      {cohortLabel(c)}
                     </td>
                     <td style={tdStyle}>{c.status ?? '—'}</td>
                     <td style={tdStyle}>{money(c.amount_invoiced)}</td>
@@ -926,7 +935,7 @@ export const AiClaimComparisonDashboard: React.FC = () => {
           <ClaimDrillDown claims={data.claims} />
         </SectionCard>
       )}
-      {data.claims?.some((c) => c.ever_not_billable) && (
+      {(data.claims?.length ?? 0) > 0 && (
         <SectionCard title="Not-Billable Claims Review">
           <NotBillableClaimsSection claims={data.claims} />
         </SectionCard>
